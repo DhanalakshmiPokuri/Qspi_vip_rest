@@ -1,0 +1,1961 @@
+class ahb_cfg extends uvm_object;
+
+  `uvm_object_utils(ahb_cfg)
+  
+  typedef enum {MASTER, SLAVE, MONITOR_ONLY} role_e;
+  rand role_e role;
+
+  uvm_active_passive_enum is_active = UVM_ACTIVE;
+  virtual ahb_if vif;
+
+  // % probability of inserting wait states (slave side)
+  rand int unsigned wait_state_prob;
+  constraint c_wait { wait_state_prob inside {[0:60]}; }
+  
+  function new(string name = "ahb_cfg");
+    super.new(name);
+    wait_state_prob = 20;
+  endfunction
+endclass
+
+  class ahb_driver extends uvm_driver #(ahb_txn);
+ 
+    `uvm_component_utils(ahb_driver)
+ 
+    ahb_cfg         cfg;
+    virtual ahb_if  vif;
+ 
+    // Fires when the LAST beat of an item completes on the bus
+    // (HREADY=1 on its data phase) - deliberately decoupled from
+    // item_done(), which fires as soon as the item's beats are queued.
+    uvm_analysis_port #(ahb_txn) item_completed_ap;
+ 
+    // Queue-based pipeline FIFO between fetch_proc and bus_proc.
+    ahb_pipe_fifo #(ahb_beat) beat_q;
+ 
+    function new(string name, uvm_component parent);
+      super.new(name, parent);
+      beat_q            = new();
+      item_completed_ap = new("item_completed_ap", this);
+    endfunction
+ 
+    function void build_phase(uvm_phase phase);
+      super.build_phase(phase);
+      if (!uvm_config_db#(ahb_cfg)::get(this, "", "cfg", cfg))
+        `uvm_fatal(get_type_name(), "cfg not set")
+      vif = cfg.vif;
+    endfunction
+ 
+    task run_phase(uvm_phase phase);
+      wait_reset();
+      fork
+        fetch_proc();
+        bus_proc();
+      join
+    endtask
+ 
+    task wait_reset();
+      wait (vif.HRESETN === 1'b1);
+      @(vif.mst_cb);
+    endtask
+ 
+ 
+    //=======================================================================
+    // PROCESS #1 : fetch_proc
+    //
+    // Pulls sequence items, expands each into its per-beat queue, pushes
+    // beats into beat_q, and calls item_done(). Never waits on HREADY or
+    // on bus_proc - it can run arbitrarily far ahead of the bus.
+    //=======================================================================
+    task fetch_proc();
+ 
+      ahb_txn   req;
+      ahb_txn   txn;
+      ahb_beat  beat;
+      int       n;
+      bit [31:0] beat_addr;
+      bit [31:0] wrap_size_bytes;
+      bit [31:0] wrap_mask;
+      bit [31:0] incr_bytes;
+ 
+      forever begin
+ 
+        seq_item_port.get_next_item(req);
+ 
+        // Clone: item_done() below hands control back to the sequence,
+        // which may reuse/modify 'req'. Beats reference 'txn' (the
+        // clone), which stays stable for as long as bus_proc needs it.
+        $cast(txn, req.clone());
+ 
+        n          = txn.num_beats();     // == txn.data.size()
+        incr_bytes = (32'(1) << txn.size);
+ 
+        wrap_size_bytes = n * incr_bytes;
+        wrap_mask       = wrap_size_bytes - 1;
+ 
+        if (txn.rd_data.size() != n) txn.rd_data = new[n];
+ 
+        for (int i = 0; i < n; i++) begin
+ 
+          beat = new();
+ 
+          if (i == 0) begin
+            beat_addr = txn.addr;
+          end
+          else if (txn.burst == AHB_WRAP4  ||
+                   txn.burst == AHB_WRAP8  ||
+                   txn.burst == AHB_WRAP16) begin
+            // Wrap within the naturally-aligned window: bits above the
+            // window stay fixed, bits inside the window wrap around.
+            beat_addr = (txn.addr & ~wrap_mask) |
+                        ((txn.addr + i * incr_bytes) & wrap_mask);
+          end
+          else begin
+            // SINGLE / INCR / INCR4/8/16: plain linear increment.
+            beat_addr = txn.addr + i * incr_bytes;
+          end
+ 
+          beat.addr      = beat_addr;
+          beat.write     = txn.write;
+          beat.size      = txn.size;
+          beat.prot      = txn.prot;
+          beat.burst     = txn.burst;
+          beat.trans     = (i == 0) ? AHB_NONSEQ : AHB_SEQ;
+          beat.wdata     = txn.write ? txn.data[i] : '0;
+          beat.parent    = txn;
+          beat.beat_idx  = i;
+          beat.last_beat = (i == n - 1);
+ 
+          beat_q.put(beat);
+        end
+ 
+        // Accept the item as soon as its beats are queued - does not
+        // wait for any of them to actually reach the bus.
+        seq_item_port.item_done();
+ 
+        // NOTE on flow control: beat_q is unbounded, so fetch_proc can
+        // run arbitrarily far ahead of bus_proc. To cap pipeline depth
+        // (e.g. to match a DUT's outstanding-transaction limit), add a
+        // `max_depth` to ahb_pipe_fifo and have put() wait while
+        // q.size() >= max_depth before pushing - same idea as a bounded
+        // mailbox, implemented explicitly.
+      end
+ 
+    endtask
+ 
+ 
+    //=======================================================================
+    // PROCESS #2 : bus_proc
+    //
+    // The ONLY process that drives vif.mst_cb.*. Two-stage address/data
+    // pipeline (unchanged logic from your paste):
+    //   - HREADY==0 on the current data-phase beat -> hold everything,
+    //     do not touch address-phase signals (address must stay stable).
+    //   - HREADY==1 -> data-phase beat completes, capture response/data,
+    //     broadcast on item_completed_ap if it was the last beat.
+    //   - promote addr_beat -> data_beat, and if another beat is already
+    //     queued, drive its address phase in the SAME cycle (this is the
+    //     actual pipelining step).
+    //=======================================================================
+    task bus_proc();
+ 
+      ahb_beat addr_beat;
+      ahb_beat data_beat;
+      bit      have_addr;
+      bit      have_data;
+ 
+      have_addr = 0;
+      have_data = 0;
+      drive_idle();
+ 
+      forever begin
+ 
+        if (!have_addr) begin
+          beat_q.get(addr_beat);
+          drive_address_phase(addr_beat);
+          have_addr = 1;
+        end
+ 
+        @(vif.mst_cb);
+ 
+        if (have_data) begin
+ 
+          if (vif.mst_cb.HREADY === 1'b0) begin
+            // STALL: data_beat's data phase is not done. Do NOT touch
+            // HADDR/HWRITE/HSIZE/HPROT/HBURST/HTRANS here - addr_beat's
+            // address phase remains on the bus unchanged.
+            if (vif.mst_cb.HRESP === 1'b1) begin
+              data_beat.hresp_err = 1'b1;
+              `uvm_error(get_type_name(),
+                $sformatf("AHB ERROR (first cycle), addr=0x%08h", data_beat.addr))
+            end
+            continue;
+          end
+ 
+          // data_beat's data phase COMPLETES this cycle.
+          data_beat.hresp_err |= vif.mst_cb.HRESP;
+ 
+          if (!data_beat.write)
+            data_beat.rdata = vif.mst_cb.HRDATA;
+ 
+          write_beat_result(data_beat);
+ 
+          have_data = 0;
+        end
+ 
+        // Promote addr_beat -> data_beat.
+        if (have_addr) begin
+          data_beat = addr_beat;
+          have_data = 1;
+          have_addr = 0;
+        end
+ 
+        // Pipeline the NEXT beat's address phase in, right now, if one
+        // is already available (this is what makes it real pipelining).
+        if (beat_q.num() > 0) begin
+          beat_q.get(addr_beat);
+          drive_address_phase(addr_beat);
+          have_addr = 1;
+        end
+        else begin
+          drive_idle();
+        end
+ 
+      end
+ 
+    endtask
+ 
+ 
+    task drive_address_phase(ahb_beat b);
+      vif.mst_cb.HADDR  <= b.addr;
+      vif.mst_cb.HWRITE <= b.write;
+      vif.mst_cb.HSIZE  <= b.size;
+      vif.mst_cb.HPROT  <= b.prot;
+      vif.mst_cb.HBURST <= b.burst;
+      vif.mst_cb.HTRANS <= b.trans;
+      // HWDATA belongs to the DATA phase (one cycle after HADDR). Driving
+      // it here means it becomes valid on the next clock, alongside this
+      // beat's data phase - correct AHB timing. Do not move this earlier
+      // or later.
+      if (b.write)
+        vif.mst_cb.HWDATA <= b.wdata;
+    endtask
+ 
+ 
+    task drive_idle();
+      vif.mst_cb.HTRANS <= AHB_IDLE;
+      vif.mst_cb.HWRITE <= 1'b0;
+    endtask
+ 
+ 
+    function void write_beat_result(ahb_beat b);
+      if (!b.write)
+        b.parent.rd_data[b.beat_idx] = b.rdata;
+      b.parent.error_resp |= b.hresp_err;
+ 
+      if (b.last_beat)
+        item_completed_ap.write(b.parent);
+    endfunction
+ 
+  endclass
+ 
+ class ahb_beat;
+ 
+    bit  [31:0]  addr;
+    bit          write;
+    bit  [2:0]   size;
+    bit  [3:0]   prot;
+    ahb_burst_e  burst;
+    ahb_trans_e  trans;        // NONSEQ for beat 0 of an item, SEQ otherwise
+    bit  [31:0]  wdata;
+ 
+    bit  [31:0]  rdata;        // filled in by bus_proc on completion
+    bit          hresp_err;    // filled in by bus_proc on completion
+ 
+    ahb_txn      parent;       // back-pointer to the owning item
+    int          beat_idx;     // index within parent (0..num_beats-1)
+    bit          last_beat;    // 1 if this is the final beat of parent
+ 
+  endclass
+class ahb_sequencer extends uvm_sequencer #(ahb_txn);
+  `uvm_component_utils(ahb_sequencer)
+  function new(string name, uvm_component parent);
+    super.new(name, parent);
+  endfunction
+endclass
+
+package ahb_pkg;
+  import uvm_pkg::*;
+  `include "uvm_macros.svh"
+
+typedef enum {
+
+AHB_SINGLE,
+AHB_INCR,
+AHB_WRAP4,
+AHB_INCR4,
+AHB_WRAP8,
+AHB_INCR8,
+AHB_WRAP16,
+AHB_INCR16
+} ahb_burst_e;
+
+typedef enum {
+  AHB_IDLE,
+  AHB_BUSY,
+  AHB_NONSEQ,
+  AHB_SEQ
+} ahb_trans_e;
+
+  `include "ahb_txn.sv"
+  `include "ahb_beat.sv"
+  `include "ahb_pipe_fifo.sv"
+  `include "ahb_cfg.sv"
+  
+  `include "ahb_driver.sv"
+  `include "ahb_monitor.sv"
+  `include "ahb_sequencer.sv"
+  `include "ahb_agent.sv"
+  `include "ahb_seq_lib.sv"
+endpackage
+
+ class ahb_base_seq extends uvm_sequence #(ahb_txn);
+    `uvm_object_utils(ahb_base_seq)
+ 
+    // Knobs that children / tests can set:
+    rand bit [31:0]   start_addr = 32'h0;
+    rand bit          do_write   = 0;           // default: read
+    rand ahb_burst_e  burst_type = AHB_SINGLE;   // default: SINGLE
+    rand bit [2:0]    size       = 3'b010;       // default: word
+    rand bit [31:0]   wdata      = 32'h0;
+ 
+    function new(string name = "ahb_base_seq");
+      super.new(name);
+    endfunction
+ 
+    // Single "send one txn" task the reusable skeleton
+    task send_txn();
+      ahb_txn t = ahb_txn::type_id::create("t");
+      start_item(t);
+      if (!t.randomize() with {
+            addr  == local::start_addr;
+            write == local::do_write;
+            burst == local::burst_type;
+            size  == local::size;
+            if (write) data[0] == local::wdata;
+          })
+        `uvm_error(get_type_name(), "randomize failed")
+      finish_item(t);
+    endtask
+ 
+    // Default body: just one txn (a basic read)
+    task body();
+      send_txn();
+    endtask
+  endclass
+ 
+ 
+  // Basic read
+  class ahb_single_read_seq extends ahb_base_seq;
+    `uvm_object_utils(ahb_single_read_seq)
+    function new(string name = "ahb_single_read_seq");
+      super.new(name);
+    endfunction
+    // body inherited: one read, SINGLE, word - knobs already default correctly
+  endclass
+ 
+ 
+  // Basic write
+  class ahb_single_write_seq extends ahb_base_seq;
+    `uvm_object_utils(ahb_single_write_seq)
+    function new(string name = "ahb_single_write_seq");
+      super.new(name);
+    endfunction
+ 
+    task body();
+      do_write = 1;       // override knob
+      send_txn();
+    endtask
+  endclass
+ 
+ 
+  // Burst read, override burst_type only
+  class ahb_burst_read_seq extends ahb_base_seq;
+    `uvm_object_utils(ahb_burst_read_seq)
+    function new(string name = "ahb_burst_read_seq");
+      super.new(name);
+    endfunction
+ 
+    task body();
+      do_write   = 0;
+      burst_type = AHB_INCR4;
+      send_txn();
+    endtask
+  endclass
+ 
+ 
+  // TC07: write config register, then read it back
+  class ahb_wr_rdback_seq extends ahb_base_seq;
+    `uvm_object_utils(ahb_wr_rdback_seq)
+    rand bit [31:0] addr;
+    rand bit [31:0] data;
+ 
+    function new(string name = "ahb_wr_rdback_seq");
+      super.new(name);
+    endfunction
+ 
+    task body();
+      do_write   = 1;
+      start_addr = addr;
+      wdata      = data;
+      send_txn();  // write
+ 
+      do_write   = 0;
+      start_addr = addr;
+      send_txn();  // readback
+    endtask
+  endclass
+ 
+ 
+  // TC02: N random single reads
+  class ahb_rand_read_seq extends ahb_base_seq;
+    `uvm_object_utils(ahb_rand_read_seq)
+    int unsigned num_txns = 10;
+ 
+    function new(string name = "ahb_rand_read_seq");
+      super.new(name);
+    endfunction
+ 
+    task body();
+      repeat (num_txns) begin
+        // randomize the knobs themselves, then send
+        assert(this.randomize() with {
+          start_addr[31:16] == 16'h0000;
+          do_write   == 0;
+          burst_type == AHB_SINGLE;
+          size       == 2;
+        });
+        send_txn();
+      end
+    endtask
+  endclass
+ class ahb_agent extends uvm_agent;
+ 
+    `uvm_component_utils(ahb_agent)
+ 
+    ahb_cfg       cfg;
+    ahb_driver    drv;
+    ahb_monitor   mon;
+    ahb_sequencer sqr;
+ 
+    function new(string name, uvm_component parent);
+      super.new(name, parent);
+    endfunction
+ 
+    function void build_phase(uvm_phase phase);
+      super.build_phase(phase);
+      if (!uvm_config_db#(ahb_cfg)::get(this, "", "cfg", cfg))
+        `uvm_fatal(get_type_name(), "cfg not set")
+ 
+      mon = ahb_monitor::type_id::create("mon", this);
+ 
+      if (cfg.is_active == UVM_ACTIVE) begin
+        drv = ahb_driver   ::type_id::create("drv", this);
+        sqr = ahb_sequencer::type_id::create("sqr", this);
+      end
+    endfunction
+ 
+    function void connect_phase(uvm_phase phase);
+      super.connect_phase(phase);
+      if (cfg.is_active == UVM_ACTIVE)
+        drv.seq_item_port.connect(sqr.seq_item_export);
+    endfunction
+ 
+  endclass
+ 
+interface ahb_if #(
+  parameter int ADDR_WIDTH = 32,
+  parameter int DATA_WIDTH = 32
+) (
+  input logic HCLK,
+  input logic HRESETN
+);
+
+  logic [ADDR_WIDTH-1:0] HADDR;
+  logic [1:0]            HTRANS;   // AHB-Lite: SINGLE/NONSEQ/SEQ/IDLE
+  logic [2:0]            HSIZE;
+  logic [2:0]            HBURST;
+  logic [3:0]            HPROT;
+  logic                  HWRITE;
+  logic [DATA_WIDTH-1:0] HWDATA; 
+  logic [DATA_WIDTH-1:0] HRDATA;
+ logic HREADYOUT;
+  logic                  HREADY;
+  logic                  HRESP;    // AHB-Lite: OKAY/ERROR
+
+  // Clocking block for master (driver)
+  clocking mst_cb @(posedge HCLK);
+    default input #1step output #1;
+    output HADDR, HTRANS, HSIZE, HBURST, HPROT,HWRITE, HWDATA;
+    input  HRDATA, HREADY, HRESP;
+  endclocking
+
+  // Clocking block for passive (monitor)
+  clocking mon_cb @(posedge HCLK);
+    default input #1step;
+    input HADDR, HTRANS, HSIZE, HBURST, HPROT, HWRITE,
+          HWDATA, HRDATA, HREADY, HRESP;
+  endclocking
+
+endinterface
+
+class ahb_txn extends uvm_sequence_item;
+ 
+ 
+    rand bit [31:0]    addr;         // start address (beat 0)
+    rand bit           write;
+    rand bit [2:0]      size;        // HSIZE: 0=byte,1=hword,2=word
+     bit [3:0]      prot;
+    rand ahb_burst_e    burst;
+    rand int unsigned   incr_len;    // only meaningful when burst==AHB_INCR
+ 
+    rand bit [31:0]     data[];      // write data, one entry per beat
+         bit [31:0]     rd_data[];   // read data,  filled in by the driver
+         bit            error_resp;  // set if ANY beat returned HRESP=ERROR
+
+
+	 
+    `uvm_object_utils_begin(ahb_txn)
+      `uvm_field_int      (addr,       UVM_HEX)
+      `uvm_field_int      (write,      UVM_BIN)
+      `uvm_field_int      (size,       UVM_HEX)
+      `uvm_field_enum     (ahb_burst_e, burst, UVM_HEX)
+      `uvm_field_int      (incr_len,   UVM_DEC)
+      `uvm_field_array_int(data,       UVM_HEX)
+      `uvm_field_array_int(rd_data,    UVM_HEX)
+      `uvm_field_int      (error_resp, UVM_BIN)
+    `uvm_object_utils_end
+    constraint c_size     { size inside {0, 1, 2}; }
+    constraint c_incr_len { incr_len inside {[1:32]}; }
+ 
+    constraint c_beats {
+      (burst == AHB_SINGLE)                  -> data.size() == 1;
+      (burst inside {AHB_WRAP4,  AHB_INCR4})  -> data.size() == 4;
+      (burst inside {AHB_WRAP8,  AHB_INCR8})  -> data.size() == 8;
+      (burst inside {AHB_WRAP16, AHB_INCR16}) -> data.size() == 16;
+      (burst == AHB_INCR)                    -> data.size() == incr_len;
+    }
+ 
+    // Address alignment to HSIZE
+    constraint c_align {
+      (size == 1) -> addr[0]   == 1'b0;
+      (size == 2) -> addr[1:0] == 2'b00;
+    }
+ 
+    function new(string name = "ahb_txn");
+      super.new(name);
+    endfunction
+ 
+    function int num_beats();
+      return data.size();
+    endfunction
+ 
+  endclass
+ 
+class ahb_monitor extends uvm_component;
+ 
+    `uvm_component_utils(ahb_monitor)
+ 
+    ahb_cfg        cfg;
+    virtual ahb_if vif;
+    uvm_analysis_port #(ahb_txn) ap;
+ 
+    function new(string name, uvm_component parent);
+      super.new(name, parent);
+      ap = new("ap", this);
+    endfunction
+ 
+    function void build_phase(uvm_phase phase);
+      super.build_phase(phase);
+      if (!uvm_config_db#(ahb_cfg)::get(this, "", "cfg", cfg))
+        `uvm_fatal(get_type_name(), "cfg not set")
+      vif = cfg.vif;
+    endfunction
+ 
+    task run_phase(uvm_phase phase);
+      fork
+        collect_transactions();
+        protocol_check();
+      join
+    endtask
+ 
+    task collect_transactions();
+      ahb_txn txn;
+      int     beat;
+      bit [31:0] addr;
+ 
+      forever begin
+        @(posedge vif.HCLK);
+        if (vif.HRESETN !== 1'b1)
+          continue;
+ 
+        // Address phase captured when HREADY high
+        if (vif.HREADY === 1'b1 && vif.HTRANS == 2'b10) begin // NONSEQ
+          txn       = ahb_txn::type_id::create("txn");
+          addr      = vif.HADDR;
+          txn.addr  = vif.HADDR;
+          txn.write = vif.HWRITE;
+          txn.size  = vif.HSIZE;
+          // explicit cast: HBURST is a plain bit vector on the bus,
+          // ahb_txn.burst is the typed enum.
+          txn.burst = ahb_burst_e'(vif.HBURST);
+          txn.prot  = vif.HPROT;
+ 
+          if (txn.write)
+            txn.data = new[16]; // max, trimmed later
+ 
+          txn.rd_data = new[16];
+          beat = 0;
+ 
+          // collect all beats of the burst
+          forever begin
+            @(posedge vif.HCLK);
+            while (vif.HREADY !== 1'b1) begin
+              if (vif.HRESP === 1'b1)
+                `uvm_error(get_type_name(), "ERROR response seen")
+              @(posedge vif.HCLK);
+            end
+            if (txn.write) txn.data[beat]    = vif.HWDATA;
+            else           txn.rd_data[beat] = vif.HRDATA;
+            beat++;
+ 
+            // Next address phase: SEQ continues burst, else burst ended
+            if (vif.HTRANS == 2'b11) begin
+              addr = addr + (1 << txn.size);
+            end
+            else break; // IDLE or NONSEQ => burst done
+          end
+ 
+          if (txn.write)
+            txn.data = new[beat](txn.data);
+          txn.rd_data = new[beat](txn.rd_data);
+ 
+          ap.write(txn);
+        end
+      end
+    endtask
+ 
+    // Independent protocol assertions (sample-based)
+    task protocol_check();
+      forever begin
+        @(posedge vif.HCLK);
+        if (!vif.HRESETN) begin
+          if (vif.HTRANS != 2'b00)
+            `uvm_error("AHB_PROTO", "HTRANS not IDLE during reset")
+        end
+        else begin
+          if (vif.HREADY === 1'b1 && vif.HTRANS == 2'b01)
+            `uvm_error("AHB_PROTO", "HTRANS BUSY is illegal in AHB-Lite single master")
+ 
+          if (vif.HREADY === 1'b1 && vif.HTRANS inside {2'b10, 2'b11}) begin
+            case (vif.HSIZE)
+              3'b001: if (vif.HADDR[0] !== 1'b0)
+                        `uvm_error("AHB_PROTO", "Halfword not aligned")
+              3'b010: if (vif.HADDR[1:0] !== 2'b00)
+                        `uvm_error("AHB_PROTO", "Word not aligned")
+            endcase
+          end
+        end
+      end
+    endtask
+ 
+  endclass
+ 
+class ahb_pipe_fifo #(type T = int);
+ 
+    local T q[$];
+    event   item_pushed;
+ 
+    // Blocking push. (A mailbox's put() can technically block on a bounded
+    // mailbox; this FIFO is unbounded like your original `new()` mailbox,
+    // so put() never stalls - kept as a task for API symmetry with get().)
+    task automatic put(T item);
+      q.push_back(item);
+      -> item_pushed;
+    endtask
+ 
+    // Blocking pop: waits for an item to exist, then removes and returns
+    // the oldest one (FIFO order).
+    task automatic get(output T item);
+      while (q.size() == 0)
+        @(item_pushed);
+      item = q.pop_front();
+    endtask
+ 
+    // Non-blocking pop: returns 0 immediately if empty instead of waiting.
+    function automatic bit try_get(output T item);
+      if (q.size() == 0) return 0;
+      item = q.pop_front();
+      return 1;
+    endfunction
+ 
+    function automatic int num();
+      return q.size();
+    endfunction
+ 
+  endclass
+class qspi_xip_env extends uvm_env;
+  `uvm_component_utils(qspi_xip_env)
+
+  ahb_agent            ahb_agt;
+  qspi_agent           qspi_agt;
+  qspi_xip_scoreboard  sb;
+
+  ahb_cfg   ahb_cfg_h;
+  qspi_cfg  qspi_cfg_h;
+
+  function new(string name, uvm_component parent);
+    super.new(name, parent);
+  endfunction
+
+  function void build_phase(uvm_phase phase);
+    super.build_phase(phase);
+
+    // Get cfg objects from test (already configured with scenario knobs)
+    if (!uvm_config_db#(ahb_cfg)::get(this, "", "ahb_cfg", ahb_cfg_h))
+      `uvm_fatal(get_type_name(), "ahb_cfg not set")
+    if (!uvm_config_db#(qspi_cfg)::get(this, "", "qspi_cfg", qspi_cfg_h))
+      `uvm_fatal(get_type_name(), "qspi_cfg not set")
+
+    // Publish down to agents
+ uvm_config_db#(ahb_cfg)::set(this, "ahb_agt*", "cfg", ahb_cfg_h);
+    uvm_config_db#(qspi_cfg)::set(this, "qspi_agt*", "cfg", qspi_cfg_h);
+    uvm_config_db#(qspi_cfg)::set(this, "sb",       "qcfg", qspi_cfg_h);
+
+    ahb_agt  = ahb_agent::type_id::create("ahb_agt", this);
+    qspi_agt = qspi_agent::type_id::create("qspi_agt", this);
+    sb       = qspi_xip_scoreboard::type_id::create("sb", this);
+  endfunction
+
+  function void connect_phase(uvm_phase phase);
+    super.connect_phase(phase);
+    ahb_agt.mon.ap.connect(sb.ahb_export);
+    qspi_agt.mon.ap.connect(sb.qspi_export);
+  endfunction
+
+endclass
+
+
+class qspi_xip_scoreboard extends uvm_scoreboard;
+  `uvm_component_utils(qspi_xip_scoreboard)
+
+  uvm_analysis_imp_ahb  #(ahb_txn,  qspi_xip_scoreboard) ahb_export;
+  uvm_analysis_imp_qspi #(qspi_txn, qspi_xip_scoreboard) qspi_export;
+
+  qspi_flash_model fmem;          // scoreboard's OWN golden model
+  qspi_cfg         qcfg;
+
+  // Queues to pair AHB reads with QSPI accesses (they arrive asynchronously)
+  ahb_txn  ahb_q[$];
+  qspi_txn qspi_q[$];
+
+  // Stats
+  int ahb_reads_checked, qspi_txns_seen, mismatches;
+
+  function new(string name, uvm_component parent);
+    super.new(name, parent);
+    ahb_export  = new("ahb_export",  this);
+    qspi_export = new("qspi_export", this);
+  endfunction
+
+  function void build_phase(uvm_phase phase);
+    super.build_phase(phase);
+    if (!uvm_config_db#(qspi_cfg)::get(this, "", "qcfg", qcfg))
+      `uvm_fatal(get_type_name(), "qcfg not set")
+    fmem = qspi_flash_model::type_id::create("fmem");
+    fmem.preload_pattern();       // SAME pattern function as responder
+  endfunction
+
+  // ---------------- AHB side ----------------
+  function void write_ahb(ahb_txn t);
+    // We only check READS (XIP controller: writes go to config regs only)
+    if (t.write) begin
+      `uvm_info(get_type_name(),
+        $sformatf("AHB write @0x%0h (reg access, no data check)", t.addr), UVM_MEDIUM)
+      return;
+    end
+    ahb_q.push_back(t);
+    try_check();
+  endfunction
+
+  // ---------------- QSPI side ----------------
+  function void write_qspi(qspi_txn t);
+    qspi_q.push_back(t);
+    qspi_txns_seen++;
+    // Command correctness (C2)
+    if (t.cmd !== qcfg.get_cmd_byte())
+      `uvm_error(get_type_name(),
+        $sformatf("C2: QSPI cmd=0x%0h, expected 0x%0h", t.cmd, qcfg.get_cmd_byte()))
+    // Dummy cycles (C4)
+    if (t.dummy_cycles !== qcfg.dummy_cycles)
+      `uvm_error(get_type_name(),
+        $sformatf("C4: dummy=%0d, expected %0d (cmd=0x%0h)",
+                  t.dummy_cycles, qcfg.dummy_cycles, t.cmd))
+    try_check();
+  endfunction
+/*
+  // ---------------- Pairing & data check (C1, C3 C5) ----------------
+  function void try_check();
+    ahb_txn  a;
+    qspi_txn q;
+
+    while (ahb_q.size() > 0 && qspi_q.size() > 0) begin
+      a = ahb_q.pop_front();
+      q = qspi_q.pop_front();
+
+      // C3: address mapping. AHB addr maps to flash addr per DUT address map.
+      // Here: flash_addr = ahb_addr[23:0]  (adjust to your DUT's map!)
+      bit [23:0] faddr = a.addr[23:0];
+      if (q.addr !== faddr)
+        `uvm_error(get_type_name(),
+          $sformatf("C3: AHB addr 0x%0h -> flash 0x%0h, QSPI saw 0x%0h",
+                    a.addr, faddr, q.addr))
+
+      // C1: data integrity  assemble expected words from flash model
+      for (int b = 0; b < a.rd_data.size(); b++) begin
+        bit [31:0] exp, act;
+        bit [23:0] fa = faddr + b*4;
+        exp = {fmem.read_byte(fa+3), fmem.read_byte(fa+2),
+               fmem.read_byte(fa+1), fmem.read_byte(fa)};
+        act = a.rd_data[b];
+        if (act !== exp) begin
+          mismatches++;
+          `uvm_error(get_type_name(),
+            $sformatf("C1: beat %0d @flash 0x%0h: got 0x%08h expected 0x%08h",
+                      b, fa, act, exp))
+        end
+      end
+      ahb_reads_checked++;
+    end
+  endfunction
+*/
+
+function void try_check();
+
+  ahb_txn  a;
+  qspi_txn q;
+
+  bit [23:0] faddr;
+  bit [23:0] fa;
+  bit [31:0] exp;
+  bit [31:0] act;
+  int b;
+
+  while (ahb_q.size() > 0 && qspi_q.size() > 0) begin
+
+    a = ahb_q.pop_front();
+    q = qspi_q.pop_front();
+
+    // C3: address mapping
+    faddr = a.addr[23:0];
+
+    if (q.addr !== faddr)
+      `uvm_error(get_type_name(),
+        $sformatf("C3: AHB addr 0x%0h -> flash 0x%0h, QSPI saw 0x%0h",
+                  a.addr, faddr, q.addr))
+
+    // C1: data integrity
+    for (b = 0; b < a.rd_data.size(); b++) begin
+
+      fa = faddr + b*4;
+
+      exp = {fmem.read_byte(fa+3),
+             fmem.read_byte(fa+2),
+             fmem.read_byte(fa+1),
+             fmem.read_byte(fa)};
+
+      act = a.rd_data[b];
+
+      if (act !== exp) begin
+        mismatches++;
+
+        `uvm_error(get_type_name(),
+          $sformatf(
+            "C1: beat %0d @flash 0x%0h: got 0x%08h expected 0x%08h",
+            b, fa, act, exp))
+      end
+    end
+
+    ahb_reads_checked++;
+
+  end
+
+endfunction
+  function void check_phase(uvm_phase phase);
+    super.check_phase(phase);
+    // C5: no orphan transactions
+    if (ahb_q.size() != 0)
+      `uvm_error(get_type_name(),
+        $sformatf("C5: %0d AHB reads never matched a QSPI access", ahb_q.size()))
+    if (qspi_q.size() != 0)
+      `uvm_error(get_type_name(),
+        $sformatf("C5: %0d QSPI accesses never matched an AHB read", qspi_q.size()))
+    `uvm_info(get_type_name(),
+      $sformatf("SB summary: %0d AHB reads checked, %0d QSPI txns, %0d mismatches",
+                ahb_reads_checked, qspi_txns_seen, mismatches), UVM_LOW)
+  endfunction
+
+endclass
+
+module tb_top;
+import uvm_pkg::*;
+import tb_pkg::*;
+`include "uvm_macros.svh"
+
+  // ---------------- Clock & Reset ----------------
+  logic hclk = 0;
+  logic hresetn;
+
+  always #5ns hclk = ~hclk;          // 100 MHz
+
+  initial begin
+    hresetn = 1'b0;
+    repeat (5) @(posedge hclk);
+    hresetn = 1'b1;
+  end
+
+  // ---------------- Interfaces ----------------
+  ahb_if  ahb_vif (.HCLK(hclk), .HRESETN(hresetn));
+  qspi_if qspi_vif (.sclk(), .rst_n(hresetn));   // sclk driven by DUT
+
+ EF_QSPI_XIP_CTRL_AHBL #(
+  .NUM_LINES   (16),
+  .LINE_SIZE   (32),
+  .RESET_CYCLES(999)
+) dut 
+(
+  .HCLK      (hclk),
+  .HRESETn   (hresetn),
+  .HSEL      (1'b1),
+  .HADDR     (ahb_vif.HADDR),
+  .HTRANS    (ahb_vif.HTRANS),
+  .HWRITE    (ahb_vif.HWRITE),
+  .HREADY    (ahb_vif.HREADY),     //UT input = global HREADY (loopback)
+  .HREADYOUT (ahb_vif.HREADYOUT),  // DUT drives this  SEPARATE signal!
+  .HRDATA    (ahb_vif.HRDATA),
+  // QSPI
+  .sck    (qspi_vif.sclk),
+  .ce_n   (qspi_vif.cs_n),
+  .din    (qspi_vif.din),      // 4-bit input bus (flash ? DUT)
+  .dout   (qspi_vif.dout),     // 4-bit output bus (DUT ? flash)
+  .douten (qspi_vif.douten)    // output enable
+);
+assign ahb_vif.HREADY = ahb_vif.HREADYOUT;
+  // ---------------- SVA checkers ----------------
+  //qspi_checker u_qspi_chk (.chk_if(qspi_vif));
+  // ahb_checker u_ahb_chk (.chk_if(ahb_vif));  // when you write it
+
+  // ---------------- UVM boot ----------------
+  initial begin
+    uvm_config_db#(virtual ahb_if)::set(null, "*", "ahb_vif",  ahb_vif);
+    uvm_config_db#(virtual qspi_if)::set(null, "*", "qspi_vif", qspi_vif);
+    run_test("tc01_smoke_test");
+  end
+
+  // Waveform + timeout guard
+  initial begin
+    #10ms;
+    `uvm_fatal("TB_TOP", "Global timeout  sim killed")
+  end
+endmodule
+
+class qspi_xip_base_test extends uvm_test;
+  `uvm_component_utils(qspi_xip_base_test)
+
+  qspi_xip_env env;
+  ahb_cfg      ahb_cfg_h;
+  qspi_cfg     qspi_cfg_h;
+
+  // Knobs children can override
+  qspi_cfg::cmd_type_e  cmd_type  = qspi_cfg::STD_READ_03;
+  int                   dummy     = 0;
+  int                   timeout_ns = 100_000;
+
+  function new(string name, uvm_component parent);
+    super.new(name, parent);
+  endfunction
+
+  function void build_phase(uvm_phase phase);
+    super.build_phase(phase);
+
+    // ---- config objects ----
+    ahb_cfg_h = ahb_cfg::type_id::create("ahb_cfg");
+    ahb_cfg_h.role      = ahb_cfg::MASTER;
+    ahb_cfg_h.is_active = UVM_ACTIVE;
+
+    qspi_cfg_h = qspi_cfg::type_id::create("qspi_cfg");
+    qspi_cfg_h.mode         = qspi_cfg::MODE00;
+    qspi_cfg_h.cmd_type     = cmd_type;
+    qspi_cfg_h.dummy_cycles = dummy;
+    qspi_cfg_h.is_active    = 1;
+    qspi_cfg_h.data_bytes   = 16;
+
+    // ---- interfaces (from tb_top) ----
+    if (!uvm_config_db#(virtual ahb_if)::get(this, "", "ahb_vif", ahb_cfg_h.vif))
+      `uvm_fatal(get_type_name(), "ahb_vif not set")
+    if (!uvm_config_db#(virtual qspi_if)::get(this, "", "qspi_vif", qspi_cfg_h.vif))
+      `uvm_fatal(get_type_name(), "qspi_vif not set")
+
+    // ---- publish to env ----
+    uvm_config_db#(ahb_cfg)::set(this,  "env", "ahb_cfg", ahb_cfg_h);
+    uvm_config_db#(qspi_cfg)::set(this, "env", "qspi_cfg", qspi_cfg_h);
+
+    env = qspi_xip_env::type_id::create("env", this);
+  endfunction
+
+  task run_phase(uvm_phase phase);
+    phase.phase_done.set_drain_time(this, 500ns);  // let last QSPI txn finish
+  endtask
+
+  // Optional watchdog
+  task watchdog();
+    #(timeout_ns * 1ns);
+    `uvm_fatal(get_type_name(), "WATCHDOG TIMEOUT  test hung")
+  endtask
+
+endclass
+class tc01_smoke_test extends qspi_xip_base_test;
+  `uvm_component_utils(tc01_smoke_test)
+
+  function new(string name, uvm_component parent); super.new(name, parent); endfunction
+
+  task run_phase(uvm_phase phase);
+    ahb_single_read_seq seq;
+    phase.raise_objection(this);
+    fork watchdog(); join_none
+    seq = ahb_single_read_seq::type_id::create("seq");
+    seq.start_addr = 32'h0000_0100;
+    seq.start(env.ahb_agt.sqr);
+    phase.drop_objection(this);
+  endtask
+endclass
+
+package tb_pkg;
+  import uvm_pkg::*;
+  `include "uvm_macros.svh"
+  import ahb_pkg::*;
+  import qspi_pkg::*;
+
+  `uvm_analysis_imp_decl(_ahb)      // move imp_decl INSIDE pkg (fixes scoreboard error)
+  `uvm_analysis_imp_decl(_qspi)
+
+  `include "scoreboard.sv"
+  `include "environment.sv"
+  `include "qspi_xip_base_test.sv"
+endpackage
+
+
+module qspi_checker (qspi_if chk_if);
+
+  import uvm_pkg::*;
+  `include "uvm_macros.svh"
+
+  // Q1: CS# must be LOW before first rising edge (setup) CS# low for >= 1 sclk edge before
+  // Simplified: while CS# low, sclk must toggle (no stuck clock mid-txn)
+  property p_cs_stuck;
+    @(posedge chk_if.sclk) disable iff (!chk_if.rst_n)
+    (!chk_if.cs_n) |-> (1'b1); // place-holder; real check below catches txn w/o clock
+  endproperty
+
+  // Q2: mode 00  CS# must not rise mid-clock-low; CS# deassert after last falling edge
+  property p_cs_deassert;
+    @(negedge chk_if.sclk) disable iff (!chk_if.rst_n)
+    (chk_if.cs_n === 1'b0) |=> (chk_if.sclk === 1'b0); // sclk idles low between txns (CPOL=0)
+  endproperty
+  Q2_CPOL0_IDLE: assert property (p_cs_deassert)
+    else `uvm_error("QSPI_CHK", "Q2: sclk not idle LOW between transactions (CPOL=0)")
+
+  // Q3: no X on io0 during command phase
+  property p_io0_known;
+    @(posedge chk_if.sclk) disable iff (!chk_if.rst_n)
+    (!chk_if.cs_n) |-> !$isunknown(chk_if.io0);
+  endproperty
+  Q3_IO0_KNOWN: assert property (p_io0_known)
+    else `uvm_error("QSPI_CHK", "Q3: io0 is X during command/address phase")
+
+  // Q4: sclk must be LOW when CS# falls (mode 00 setup rule)
+  property p_cs_setup;
+    @(negedge chk_if.cs_n) disable iff (!chk_if.rst_n)
+    (chk_if.sclk === 1'b0);
+  endproperty
+  Q4_CS_SETUP: assert property (p_cs_setup)
+    else `uvm_error("QSPI_CHK", "Q4: CS# asserted while sclk HIGH (mode 00 violation)")
+
+  // Coverage: saw each command type
+  C_CMD03: cover property (@(negedge chk_if.cs_n) chk_if.rst_n);  // expand per cmd decode in monitor
+
+endmodule
+
+package qspi_pkg;
+  import uvm_pkg::*;
+  `include "uvm_macros.svh"
+
+  `include "qspi_txn.sv"
+  `include "qspi_cfg.sv"
+  `include "qspi_flash_model.sv"
+  `include "qspi_driver.sv"
+  `include "qspi_monitor.sv"
+  `include "qspi_agent.sv"
+endpackage
+
+interface qspi_if (input logic sclk, input logic rst_n);
+  logic       cs_n;      // = ce_n from DUT
+  logic [3:0] dout;      // DUT ? flash (driven when douten=1)
+  logic [3:0] douten;    // DUT output enable per lane
+  logic [3:0] din;       // flash ? DUT (VIP drives)
+
+  // VIP (flash model) drives din based what DUT sends on dout
+ // Data sampling: DUT samples din on sclk edges; VIP launches on opposite edge
+endinterface
+
+class qspi_txn extends uvm_sequence_item;
+
+  // Captured command info (what the DUT sent)
+  rand bit [7:0]   cmd;          // 0x03 / 0x0B / 0xEB
+  rand bit [23:0]  addr ;         // 24-bit flash address
+  rand bit [7:0]   mode_bits;    // M7..M0 for 0xEB (XIP continuous)
+  rand int         dummy_cycles; // clocks between addr/mode and data
+
+  // Data (what flash returned)
+  rand bit [7:0]   data[];       // bytes returned by flash
+  bit              continuous_read; // decoded from mode bits M5-0 = 111111
+
+  `uvm_object_utils(qspi_txn)
+
+  constraint c_cmd   { cmd inside {8'h03, 8'h0B, 8'hEB}; }
+  constraint c_dummy {
+    (cmd == 8'h03) -> dummy_cycles == 0;
+    (cmd == 8'h0B) -> dummy_cycles inside {[2:16]};
+    (cmd == 8'hEB) -> dummy_cycles inside {[2:8]};
+  }
+
+  function new(string name = "qspi_txn");
+    super.new(name);
+  endfunction
+
+  // manual methods (no field macros, per your style)
+  virtual function void do_print(uvm_printer printer);
+    super.do_print(printer);
+    printer.print_field("cmd",cmd,8, UVM_HEX);
+    printer.print_field("addr",addr,24, UVM_HEX);
+    printer.print_field("mode_bits",mode_bits, 8, UVM_HEX);
+    printer.print_field("dummy",dummy_cycles, 32, UVM_DEC);
+    printer.print_field("cont_read",continuous_read, 1, UVM_BIN);
+    foreach (data[i])
+      printer.print_field($sformatf("data[%0d]", i), data[i], 8, UVM_HEX);
+  endfunction
+
+  virtual function void do_copy(uvm_object rhs);
+    qspi_txn that;
+    super.do_copy(rhs);
+    assert($cast(that, rhs));
+    cmd             = that.cmd;
+    addr            = that.addr;
+    mode_bits       = that.mode_bits;
+    dummy_cycles    = that.dummy_cycles;
+    data            = new[that.data.size()](that.data);
+    continuous_read = that.continuous_read;
+  endfunction
+
+endclass
+
+class qspi_cfg extends uvm_object;
+
+  typedef enum {MODE00, MODE03} spi_mode_e;
+  typedef enum {STD_READ_03, FAST_READ_0B, QUAD_READ_EB} cmd_type_e;
+
+  spi_mode_e  mode          = MODE00;   // our DUT uses mode 00
+  cmd_type_e  cmd_type      = STD_READ_03;
+  int         dummy_cycles  = 0;        // expected dummy (from DUT config reg)
+  bit         quad_enable   = 0;        // flash QE status bit
+  bit         is_active     = 1;
+  bit         inject_error  = 0;        // future: corrupt data to test DUT
+  int         data_bytes    = 16;       // default response length
+
+  virtual qspi_if vif;
+
+  `uvm_object_utils(qspi_cfg)
+
+  function new(string name = "qspi_cfg");
+    super.new(name);
+  endfunction
+
+  function bit [7:0] get_cmd_byte();
+    case (cmd_type)
+      STD_READ_03 : return 8'h03;
+      FAST_READ_0B: return 8'h0B;
+      QUAD_READ_EB: return 'hEB;
+    endcase
+  endfunction
+
+endclass
+
+/*
+class qspi_monitor extends uvm_monitor;
+
+  `uvm_component_utils(qspi_monitor)
+
+  qspi_cfg         cfg;
+  virtual qspi_if  vif;
+  uvm_analysis_port #(qspi_txn) ap;
+
+  function new(string name, uvm_component parent);
+    super.new(name, parent);
+    ap = new("ap", this);
+  endfunction
+
+  function void build_phase(uvm_phase phase);
+    super.build_phase(phase);
+    if (!uvm_config_db#(qspi_cfg)::get(this, "", "cfg",cfg))
+      `uvm_fatal(get_type_name(), "cfg not set")
+    vif = cfg.vif;
+  endfunction
+
+  task run_phase(uvm_phase phase);
+    forever begin
+      collect_txn();
+    end
+  endtask
+
+  task collect_txn();
+    qspi_txn  t = qspi_txn::type_id::create("t");
+    bit [7:0] cmd;
+    bit [23:0] a ;
+    bit [7:0]  m ;
+    int d;
+    @(negedge vif.cs_n);
+
+    // command byte
+    cmd = 0;
+    repeat (8) begin
+      @(posedge vif.sclk);
+      cmd = {cmd[6:0], vif.io0};
+    endt
+    t.cmd = cmd;
+
+    case (cmd)
+      8'h03, 8'h0B: begin
+        // 24-bit addr single lane
+        
+       a=0;
+        repeat (24) begin
+          @(posedge vif.sclk);
+          a = {a[22:0], vif.io0};
+        end
+        t.addr = a;
+        if (cmd == 8'h0B) begin
+          // count dummy clocks: io lines idle until data starts (io1 toggles)
+          d = 0;
+          forever begin
+            @(posedge vif.sclk);
+            d++;
+            if (vif.io1 !== 1'bz && vif.io1 !== vif.io1_prev_dummy) 
+             break; // data started
+          end
+          t.dummy_cycles = d;
+        end else
+          t.dummy_cycles = 0;
+
+        // capture data bytes on io1 until CS# high
+        capture_data_single(t);
+      end
+
+      8'hEB: begin
+       a = 0;
+       m=0;
+        repeat (12) begin   // addr quad
+          @(posedge vif.sclk);
+          a = (a << 4) | {vif.io3, vif.io2, vif.io1, vif.io0};
+        end
+        t.addr = a;
+        repeat (4) begin    // mode quad
+          @(posedge vif.sclk);
+          m = (m << 4) | {vif.io3, vif.io2, vif.io1, vif.io0};
+        end
+        t.mode_bits = m;
+        t.continuous_read = (m[5:0] == 6'b111111);
+        // dummy
+         d = 0;
+        forever begin
+          @(posedge vif.sclk);
+         d++;
+          if (vif.io1 !== 1'bz) break;
+        end
+        t.dummy_cycles = d;
+        capture_data_quad(t);
+      end
+
+      default: @(posedge vif.cs_n);  // unknown cmd skip
+    endcase
+
+    @(posedge vif.cs_n);
+    `uvm_info(get_type_name(), {"\n", t.sprint()}, UVM_MEDIUM)
+    ap.write(t);
+  endtask
+
+  task capture_data_single(qspi_txn t);
+    bit [7:0] d;
+    t.data = new[0];
+    while (vif.cs_n === 1'b0) begin
+      d = 0;
+      repeat (8) begin
+        if (vif.cs_n !== 1'b0) return;
+        @(posedge vif.sclk);
+        d = {d[6:0], vif.io1};
+      end
+      t.data = new[t.data.size()+1](t.data);
+      t.data[t.data.size()-1] = d;
+    end
+  endtask
+
+  // Quad data: one byte per TWO clocks, 4 bits/clock across
+  // {io3,io2,io1,io0}, MS nibble first then LS nibble  matches
+  // FLASH_READER_QSPI's data[counter/2-10] <= {data[..][3:0], din}
+  task capture_data_quad(qspi_txn t);
+    bit [7:0] d;
+    t.data = new[0];
+    while (vif.cs_n === 1'b0) begin
+      d = 0;
+      repeat (2) begin
+        if (vif.cs_n !== 1'b0) return;
+        @(posedge vif.sclk);
+        d = {d[3:0], vif.io3, vif.io2, vif.io1, vif.io0};
+      end
+      t.data = new[t.data.size()+1](t.data);
+      t.data[t.data.size()-1] = d;
+    end
+  endtask
+
+endclass
+
+
+
+class qspi_monitor extends uvm_monitor;
+
+  `uvm_component_utils(qspi_monitor)
+
+  qspi_cfg         cfg;
+  virtual qspi_if  vif;
+  uvm_analysis_port #(qspi_txn) ap;
+
+  function new(string name, uvm_component parent);
+    super.new(name, parent);
+    ap = new("ap", this);
+  endfunction
+
+  function void build_phase(uvm_phase phase);
+    super.build_phase(phase);
+    if (!uvm_config_db#(qspi_cfg)::get(this, "", "cfg",cfg))
+      `uvm_fatal(get_type_name(), "cfg not set")
+    vif = cfg.vif;
+  endfunction
+
+  task run_phase(uvm_phase phase);
+    forever begin
+      collect_txn();
+    end
+  endtask
+
+  task collect_txn();
+    qspi_txn  t = qspi_txn::type_id::create("t");
+    bit [7:0] cmd;
+    bit [23:0] a;
+    bit [7:0]  m;
+
+    @(negedge vif.cs_n);
+
+    // command byte
+    cmd = 0;
+    repeat (8) begin
+      @(posedge vif.sclk);
+      cmd = {cmd[6:0], vif.io0};
+    end
+    t.cmd = cmd;
+
+    case (cmd)
+      8'h03, 8'h0B: begin
+        // 24-bit addr single lane
+        a = 0;
+        repeat (24) begin
+          @(posedge vif.sclk);
+          a = {a[22:0], vif.io0};
+        end
+        t.addr = a;
+
+        // Dummy cycles are a fixed protocol constant, not something to
+        // sniff off the bus  the host drives 0 (not z) through this
+        // whole phase, so watching for io1 to leave 'z' never works.
+        // Just consume the configured count of clocks.
+        t.dummy_cycles = (cmd == 8'h0B) ? cfg.dummy_cycles : 0;
+        repeat (t.dummy_cycles) @(posedge vif.sclk);
+
+        // capture data bytes on io1 until CS# high
+        capture_data_single(t);
+      end
+
+      8'hEB: begin
+        // QUAD I/O FAST READ, continuous-read variant:
+        //   addr : 6 clocks, x4 (24 bits / 4 bits-per-clock)
+        //   mode : 2 clocks, x4 (8 bits / 4 bits-per-clock)  drives 8'hA5
+        //   dummy: fixed count from cfg (4 for this DUV, driven as 0 by
+        //          the host, not released to z, so it can't be detected
+        //          on the bus  just consume the clocks)
+        a = 0;
+        m = 0;
+        repeat (6) begin   // addr quad
+          @(posedge vif.sclk);
+          a = (a << 4) | {vif.io3, vif.io2, vif.io1, vif.io0};
+        end
+        t.addr = a;
+
+        repeat (2) begin    // mode quad
+          @(posedge vif.sclk);
+          m = (m << 4) | {vif.io3, vif.io2, vif.io1, vif.io0};
+        end
+        t.mode_bits = m;
+        t.continuous_read = (m[5:0] == 6'b111111);
+
+        t.dummy_cycles = cfg.dummy_cycles;
+        repeat (t.dummy_cycles) @(posedge vif.sclk);
+
+        capture_data_quad(t);
+      end
+
+      // FLASH_RESET sequence (8'h66 Enable Reset, 8'h99 Reset Device):
+      // no address, no data  just let CS# go high.
+      8'h66, 8'h99: ;
+
+      default: ;  // unknown cmd  fall through to CS# high wait below
+    endcase
+
+    @(posedge vif.cs_n);
+    `uvm_info(get_type_name(), {"\n", t.sprint()}, UVM_MEDIUM)
+    ap.write(t);
+  endtask
+
+  task capture_data_single(qspi_txn t);
+    bit [7:0] d;
+    t.data = new[0];
+    while (vif.cs_n === 1'b0) begin
+      d = 0;
+      repeat (8) begin
+        if (vif.cs_n !== 1'b0) return;
+        @(posedge vif.sclk);
+        d = {d[6:0], vif.io1};
+      end
+      t.data = new[t.data.size()+1](t.data);
+      t.data[t.data.size()-1] = d;
+    end
+  endtask
+
+task capture_data_quad(qspi_txn t);
+  bit [7:0] d;
+
+  t.data = new[0];
+
+  while (vif.cs_n === 1'b0) begin
+    d = 0;
+
+    repeat (2) begin
+      if (vif.cs_n !== 1'b0)
+        return;
+
+      @(posedge vif.sclk);
+
+      d = {d[3:0], vif.io3, vif.io2, vif.io1, vif.io0};
+    end
+
+    t.data = new[t.data.size()+1](t.data);
+    t.data[t.data.size()-1] = d;
+  end
+endtask
+
+
+endclass
+*/
+
+
+class qspi_monitor extends uvm_monitor;
+
+  `uvm_component_utils(qspi_monitor)
+
+  qspi_cfg         cfg;
+  virtual qspi_if  vif;
+  uvm_analysis_port #(qspi_txn) ap;
+
+  function new(string name, uvm_component parent);
+    super.new(name, parent);
+    ap = new("ap", this);
+  endfunction
+
+  function void build_phase(uvm_phase phase);
+    super.build_phase(phase);
+    if (!uvm_config_db#(qspi_cfg)::get(this, "", "cfg", cfg))
+      `uvm_fatal(get_type_name(), "cfg not set")
+    vif = cfg.vif;
+  endfunction
+
+  task run_phase(uvm_phase phase);
+    forever begin
+      collect_txn();
+    end
+  endtask
+
+  task collect_txn();
+    qspi_txn  t = qspi_txn::type_id::create("t");
+    bit [7:0] cmd;
+    bit [23:0] a;
+    bit [7:0]  m;
+
+    @(negedge vif.cs_n);
+
+    // Command byte (driven by DUT on dout[0])
+    cmd = 0;
+    repeat (8) begin
+      @(posedge vif.sclk);
+      cmd = {cmd[6:0], vif.dout[0]};
+    end
+    t.cmd = cmd;
+
+    case (cmd)
+      8'h03, 8'h0B: begin
+        // 24-bit addr single lane (driven by DUT on dout[0])
+        a = 0;
+        repeat (24) begin
+          @(posedge vif.sclk);
+          a = {a[22:0], vif.dout[0]};
+        end
+        t.addr = a;
+
+        t.dummy_cycles = (cmd == 8'h0B) ? cfg.dummy_cycles : 0;
+        repeat (t.dummy_cycles) @(posedge vif.sclk);
+
+        // Capture single-lane read data returned by flash on din[1]
+        capture_data_single(t);
+      end
+
+      8'hEB: begin
+        // QUAD I/O FAST READ: addr and mode driven by DUT on dout[3:0]
+        a = 0;
+        m = 0;
+        repeat (6) begin   // addr quad
+          @(posedge vif.sclk);
+          a = (a << 4) | {vif.dout[3], vif.dout[2], vif.dout[1], vif.dout[0]};
+        end
+        t.addr = a;
+
+        repeat (2) begin    // mode quad
+          @(posedge vif.sclk);
+          m = (m << 4) | {vif.dout[3], vif.dout[2], vif.dout[1], vif.dout[0]};
+        end
+        t.mode_bits = m;
+        t.continuous_read = (m[5:0] == 6'b111111);
+
+        t.dummy_cycles = cfg.dummy_cycles;
+        repeat (t.dummy_cycles) @(posedge vif.sclk);
+
+        // Capture quad read data returned by flash on din[3:0]
+        capture_data_quad(t);
+      end
+
+      8'h66, 8'h99: ; // FLASH_RESET sequence
+
+      default: ;  // unknown cmd
+    endcase
+
+    @(posedge vif.cs_n);
+    `uvm_info(get_type_name(), {"\n", t.sprint()}, UVM_MEDIUM)
+    ap.write(t);
+  endtask
+
+  task capture_data_single(qspi_txn t);
+    bit [7:0] d;
+    t.data = new[0];
+    while (vif.cs_n === 1'b0) begin
+      d = 0;
+      repeat (8) begin
+        if (vif.cs_n !== 1'b0) return;
+        @(posedge vif.sclk);
+        // Single data read comes back from flash via din[1]
+        d = {d[6:0], vif.din[1]};
+      end
+      t.data = new[t.data.size()+1](t.data);
+      t.data[t.data.size()-1] = d;
+    end
+  endtask
+
+  task capture_data_quad(qspi_txn t);
+    bit [7:0] d;
+    t.data = new[0];
+    while (vif.cs_n === 1'b0) begin
+      d = 0;
+      repeat (2) begin
+        if (vif.cs_n !== 1'b0)
+          return;
+        @(posedge vif.sclk);
+        // Quad data read comes back from flash via din[3:0]
+        d = {d[3:0], vif.din[3], vif.din[2], vif.din[1], vif.din[0]};
+      end
+      t.data = new[t.data.size()+1](t.data);
+      t.data[t.data.size()-1] = d;
+    end
+  endtask
+
+endclass
+class qspi_agent extends uvm_agent;
+
+  `uvm_component_utils(qspi_agent)
+
+  qspi_cfg     cfg;
+  qspi_driver  drv;
+  qspi_monitor mon;
+  uvm_sequencer#(qspi_txn) sqr;   // present for completeness; responder doesn't need it
+
+  function new(string name, uvm_component parent);
+    super.new(name, parent);
+  endfunction
+
+  function void build_phase(uvm_phase phase);
+    super.build_phase(phase);
+    if (!uvm_config_db#(qspi_cfg)::get(this, "", "cfg", cfg))
+      `uvm_fatal(get_type_name(), "cfg not set")
+    mon = qspi_monitor::type_id::create("mon", this);
+    if (cfg.is_active == UVM_ACTIVE) begin
+      drv = qspi_driver::type_id::create("drv", this);
+      //sqr =("sqr", this);
+    end
+  endfunction
+
+  function void connect_phase(uvm_phase phase);
+    super.connect_phase(phase);
+    //if (cfg.is_active == UVM_ACTIVE)
+     // drv.seq_item_port.connect(sqr.seq_item_export);
+  endfunction
+
+endclass
+
+class qspi_flash_model extends uvm_object;
+
+  bit [7:0] mem [bit [23:0]];   // sparse flash memory
+  int       size_bytes = 1 << 20;  // 1MB model
+
+  `uvm_object_utils(qspi_flash_model)
+
+  function new(string name = "qspi_flash_model");
+    super.new(name);
+  endfunction
+
+  // Preload with deterministic pattern: mem[A] = f(A)
+  // Scoreboard uses the SAME function to compute expected AHB data
+  function void preload_pattern();
+    for (int a = 0; a < size_bytes; a += 4) begin
+      mem[a]   = bit'(a[7:0])   ^ 8'hA5;
+      mem[a+1] = bit'(a[15:8])  ^ 8'h5A;
+      mem[a+2] = bit'(a[23:16]) ^ 8'h33;
+      mem[a+3] = bit'(a[23:16]) ^ 8'hCC;
+    end
+  endfunction
+  function bit [7:0] read_byte(bit [23:0] addr);
+    if (mem.exists(addr))
+    return mem[addr];
+    else           
+  return 8'hFF;  // erased flash reads FF
+  endfunction
+
+endclass
+
+/*
+class qspi_driver extends uvm_driver #(qspi_txn);
+
+  `uvm_component_utils(qspi_driver)
+
+  qspi_cfg         cfg;
+  qspi_flash_model fmem;
+  virtual qspi_if  vif;
+
+  function new(string name, uvm_component parent);
+    super.new(name,parent);
+  endfunction
+  function void build_phase(uvm_phase phase);
+    super.build_phase(phase);
+    if (!uvm_config_db#(qspi_cfg)::get(this, "", "cfg", cfg))
+      `uvm_fatal(get_type_name(), "cfg not set")
+    vif  = cfg.vif;
+    fmem = qspi_flash_model::type_id::create("fmem");
+    fmem.preload_pattern();
+  endfunction
+
+  task run_phase(uvm_phase phase);
+    forever begin
+      wait (vif.rst_n === 1'b1);
+      respond_to_txn();   // blocks until one full flash access completes
+    end
+  endtask
+
+  // Main responder: waits for CS# low, decodes, drives data
+  task respond_to_txn();
+    // release all four lines by default; only drive what the phase need
+
+    bit [7:0]  cmd;
+    bit [23:0] addr;
+    bit [7:0]  mode;
+    int        dummy;
+    int        nbytes = cfg.data_bytes;
+
+    vif.io0 = 1'bz;
+    vif.io1 = 1'bz;
+    vif.io2 = 1'bz;
+    vif.io3 = 1'bz;
+
+    // 1) Wait for CS# to go LOW (transaction starts)
+    @(negedge vif.cs_n);
+
+    // 2) Decode command byte: 8 clocks 1 bit/clock on io0 (MSB first)
+   cmd = 8'h0;
+    repeat (8) begin
+      @(posedge vif.sclk);        // mode 00: sample on rising edge
+      cmd = {cmd[6:0], vif.io0};
+    end
+
+    case (cmd)
+      8'h03: begin               // STANDARD READ: 24-bit addr on io0, data on io1
+        read_addr_single(addr);
+        dummy = 0;
+        drive_data_single(addr, nbytes);
+      end
+
+      8'h0B: begin               // FAST READ: addr, dummy, data on io1
+      read_addr_single(addr);
+        dummy = cfg.dummy_cycles;
+        repeat (dummy) @(posedge vif.sclk);   // hi-Z during dummy
+        drive_data_single(addr, nbytes);
+      end
+
+      8'hEB: begin               // QUAD IO READ: addr+mode on io0-3 (2b/clk), dummy, quad data
+        read_addr_quad(addr);          // 24 bits / 2 bits per clock = 12 clocks
+        read_mode_quad(mode);          // 8 bits / 2 bits per clock = 4 clocks
+        dummy = cfg.dummy_cycles;
+        repeat (dummy) @(posedge vif.sclk);
+        drive_data_quad(addr, nbytes);
+      end
+
+      default: begin
+        `uvm_warning(get_type_name(),
+          $sformatf("Unsupported command 0x%0h waiting for CS# high", cmd))
+        @(posedge vif.cs_n);      // just wait for txn to end
+      end
+    endcase
+
+    // 3) Wait for CS# HIGH (transaction ends)
+    @(posedge vif.cs_n);
+    // release data lines
+    vif.io0 = 1'bz;
+    vif.io1 = 1'bz; 
+    vif.io2 = 1'bz; 
+    vif.io3 = 1'bz;
+
+  endtask
+
+  //Address capture helpers 
+  // Single-lane: 24 bits, MSB first on io0, 1 bit/clock
+  task read_addr_single(output bit [23:0] a);
+     a = 0;
+    repeat (24) begin
+      @(posedge vif.sclk);
+      a = {a[22:0], vif.io0};
+    end
+    
+  endtask
+
+  // Quad: 24 bits, 2 bits/clock on io0(io0=MSB of pair),io3,io2,io1 order
+  // NOTE: exact bit order per flash datasheet  W25Q: IO0=A23,A22... pairs
+  // (io3,io2,io1,io0) per clock. Adjust to match your DUT/flash.
+  task read_addr_quad(output bit [23:0] a);
+     a = 0;
+    repeat (6) begin
+      @(posedge vif.sclk);
+     a = (a << 4) | {vif.io3, vif.io2, vif.io1, vif.io0};
+    end
+  endtask
+
+  task read_mode_quad(output bit [7:0] m);
+    m = 0;
+    repeat (2) begin
+      @(posedge vif.sclk);
+     m = ((m << 4) | {vif.io3, vif.io2, vif.io1, vif.io0});
+    end
+  endtask
+
+  // Data drive helpers 
+  // Single lane: drive bytes MSB-first on io1, launch on FALLING edge
+  task drive_data_single(bit [23:0] addr, int nbytes);
+    for (int i = 0; i < nbytes; i++) begin
+      bit [7:0] d = fmem.read_byte(addr + i);
+      repeat (8) begin
+        @(negedge vif.sclk);                 // mode 00: launch on falling edge
+        vif.io1 = d[7];
+        d = d << 1;
+      end
+    end
+  endtask
+
+  task drive_data_quad(bit [23:0] addr, int nbytes);
+    for (int i = 0; i < nbytes; i++) begin
+      bit [7:0] d = fmem.read_byte(addr + i);
+      @(negedge vif.sclk);
+      {vif.io3, vif.io2, vif.io1, vif.io0} = d[7:4];   // MS nibble
+      @(negedge vif.sclk);
+      {vif.io3, vif.io2, vif.io1, vif.io0} = d[3:0];   // LS nibble
+    end
+  endtask
+
+
+endclass
+
+*/
+
+class qspi_driver extends uvm_driver #(qspi_txn);
+
+  `uvm_component_utils(qspi_driver)
+
+  qspi_cfg         cfg;
+  qspi_flash_model fmem;
+  virtual qspi_if  vif;
+
+  function new(string name, uvm_component parent);
+    super.new(name, parent);
+  endfunction
+
+  function void build_phase(uvm_phase phase);
+    super.build_phase(phase);
+    if (!uvm_config_db#(qspi_cfg)::get(this, "", "cfg", cfg))
+      `uvm_fatal(get_type_name(), "cfg not set")
+    vif  = cfg.vif;
+    fmem = qspi_flash_model::type_id::create("fmem");
+    fmem.preload_pattern();
+  endfunction
+
+  task run_phase(uvm_phase phase);
+    forever begin
+      wait (vif.rst_n === 1'b1);
+      respond_to_txn();   // blocks until one full flash access completes
+    end
+  endtask
+
+  // Main responder: waits for CS# low, decodes, drives data
+  task respond_to_txn();
+    bit [7:0]  cmd;
+    bit [23:0] addr;
+    bit [7:0]  mode;
+    int        dummy;
+    int        nbytes = cfg.data_bytes;
+
+    // Release flash output lines by default (tri-state din)
+    vif.din = 4'bz;
+
+    // 1) Wait for CS# to go LOW (transaction starts)
+    @(negedge vif.cs_n);
+
+    // 2) Decode command byte: 8 clocks 1 bit/clock on dout[0] (MSB first)
+    cmd = 8'h0;
+    repeat (8) begin
+      @(posedge vif.sclk);        // mode 00: sample on rising edge
+      cmd = {cmd[6:0], vif.dout[0]};
+    end
+
+    case (cmd)
+      8'h03: begin               // STANDARD READ: 24-bit addr on dout[0], data on din[1]
+        read_addr_single(addr);
+        dummy = 0;
+        drive_data_single(addr, nbytes);
+      end
+
+      8'h0B: begin               // FAST READ: addr, dummy, data on din[1]
+        read_addr_single(addr);
+        dummy = cfg.dummy_cycles;
+        repeat (dummy) @(posedge vif.sclk);   // hi-Z during dummy
+        drive_data_single(addr, nbytes);
+      end
+
+      8'hEB: begin               // QUAD IO READ: addr+mode on dout[3:0], dummy, quad data on din[3:0]
+        read_addr_quad(addr);          // 24 bits / 2 bits per clock = 12 clocks (actually 6 clocks at 4 bits/clk)
+        read_mode_quad(mode);          // 8 bits / 4 bits per clock = 2 clocks
+        dummy = cfg.dummy_cycles;
+        repeat (dummy) @(posedge vif.sclk);
+        drive_data_quad(addr, nbytes);
+      end
+
+      default: begin
+        `uvm_warning(get_type_name(),
+          $sformatf("Unsupported command 0x%0h waiting for CS# high", cmd))
+        @(posedge vif.cs_n);      // just wait for txn to end
+      end
+    endcase
+
+    // 3) Wait for CS# HIGH (transaction ends)
+    @(posedge vif.cs_n);
+    // Release data lines
+    vif.din = 4'bz;
+
+  endtask
+
+  // Address capture helpers (Sample DUT outputs on vif.dout)
+  task read_addr_single(output bit [23:0] a);
+    a = 0;
+    repeat (24) begin
+      @(posedge vif.sclk);
+      a = {a[22:0], vif.dout[0]};
+    end
+  endtask
+
+  task read_addr_quad(output bit [23:0] a);
+    a = 0;
+    repeat (6) begin
+      @(posedge vif.sclk);
+      a = (a << 4) | {vif.dout[3], vif.dout[2], vif.dout[1], vif.dout[0]};
+    end
+  endtask
+
+  task read_mode_quad(output bit [7:0] m);
+    m = 0;
+    repeat (2) begin
+      @(posedge vif.sclk);
+      m = ((m << 4) | {vif.dout[3], vif.dout[2], vif.dout[1], vif.dout[0]});
+    end
+  endtask
+
+  // Data drive helpers (Drive flash outputs to DUT via vif.din)
+  task drive_data_single(bit [23:0] addr, int nbytes);
+    for (int i = 0; i < nbytes; i++) begin
+      bit [7:0] d = fmem.read_byte(addr + i);
+      repeat (8) begin
+        @(negedge vif.sclk);                 // mode 00: launch on falling edge
+        vif.din[1] = d[7];
+        d = d << 1;
+      end
+    end
+    vif.din = 4'bz; // release after data transfer
+  endtask
+
+  task drive_data_quad(bit [23:0] addr, int nbytes);
+    for (int i = 0; i < nbytes; i++) begin
+      bit [7:0] d = fmem.read_byte(addr + i);
+      @(negedge vif.sclk);
+      vif.din = d[7:4];    // MS nibble on din[3:0]
+      @(negedge vif.sclk);
+      vif.din = d[3:0];    // LS nibble on din[3:0]
+    end
+    vif.din = 4'bz;        // release after data transfer
+  endtask
+
+endclass

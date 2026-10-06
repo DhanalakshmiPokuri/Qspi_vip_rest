@@ -1,0 +1,13 @@
+# Editor temporary files
+*.swp
+*.swo
+*~
+
+# ModelSim / Questa generated files
+sim/work/
+sim/*.wlf
+sim/transcript
+sim/vsim_stacktrace.vstf
+sim/*.log
+sim/*.vstf
+sim/.*

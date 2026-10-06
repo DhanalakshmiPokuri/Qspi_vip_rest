@@ -1,0 +1,1036 @@
+class ahb_cfg extends uvm_object;
+
+  `uvm_object_utils(ahb_cfg)
+  
+  typedef enum {MASTER, SLAVE, MONITOR_ONLY} role_e;
+  rand role_e role;
+
+  uvm_active_passive_enum is_active = UVM_ACTIVE;
+  virtual ahb_if vif;
+
+  // % probability of inserting wait states (slave side)
+  rand int unsigned wait_state_prob;
+  constraint c_wait { wait_state_prob inside {[0:60]}; }
+  
+  function new(string name = "ahb_cfg");
+    super.new(name);
+    wait_state_prob = 20;
+  endfunction
+endclass
+
+class ahb_sequencer extends uvm_sequencer #(ahb_txn);
+  `uvm_component_utils(ahb_sequencer)
+  function new(string name, uvm_component parent);
+    super.new(name, parent);
+  endfunction
+endclass
+
+package ahb_pkg;
+  import uvm_pkg::*;
+  `include "uvm_macros.svh"
+
+  `include "ahb_txn.sv"
+  `include "ahb_cfg.sv"
+  `include "ahb_driver.sv"
+  `include "ahb_monitor.sv"
+  `include "ahb_sequencer.sv"
+  `include "ahb_agent.sv"
+  `include "ahb_seq_lib.sv"
+endpackage
+
+class ahb_base_seq extends uvm_sequence #(ahb_txn);
+  `uvm_object_utils(ahb_base_seq)
+
+  // Knobs that children / tests can set:
+  rand bit [31:0] start_addr = 32'h0;
+  rand bit        do_write   = 0;          // default: read
+  rand bit [2:0]  burst_type = 3'b000;     // default: SINGLE
+  rand bit [2:0]  size       = 3'b010;     // default: word
+  rand bit [31:0] wdata      = 32'h0;
+
+  function new(string name="ahb_base_seq"); 
+	super.new(name);
+  endfunction
+
+  // Single "send one txn" task the reusable skeleton
+  task send_txn();
+    ahb_txn t = ahb_txn::type_id::create("t");
+    start_item(t);
+    if (!t.randomize() with {
+          addr  == local::start_addr;
+          write == local::do_write;
+          burst == local::burst_type;
+          size  == local::size;
+          if (write) { data.size() == 1; data[0] == local::wdata; }
+        })
+      `uvm_error(get_type_name(), "randomize failed")
+    finish_item(t);
+  endtask
+
+  // Default body: just one txn (a basic read)
+  task body();
+    send_txn();
+  endtask
+endclass
+
+
+// Basic read (what your ahb_single_read_seq did)
+class ahb_single_read_seq extends ahb_base_seq;
+  `uvm_object_utils(ahb_single_read_seq)
+  function new(string name="ahb_single_read_seq");
+  super.new(name);
+  endfunction
+  // body inherited: one read, SINGLE, word  knobs already default correctly
+endclass
+
+// Basic write
+class ahb_single_write_seq extends ahb_base_seq;
+  `uvm_object_utils(ahb_single_write_seq)
+  function new(string name="ahb_single_write_seq");
+   super.new(name); 
+  endfunction
+
+  task body();
+    do_write = 1;       // override knob
+    send_txn();
+  endtask
+endclass
+
+// Burst read override burst_type only
+class ahb_burst_read_seq extends ahb_base_seq;
+  `uvm_object_utils(ahb_burst_read_seq)
+  function new(string name="ahb_burst_read_seq"); super.new(name); endfunction
+
+  task body();
+    do_write   = 0;
+    burst_type = 3'b011;                 // INCR4  or make this a rand knob too
+    send_txn();
+  endtask
+endclass
+
+
+// TC07: write config register, then read it back
+class ahb_wr_rdback_seq extends ahb_base_seq;
+  `uvm_object_utils(ahb_wr_rdback_seq)
+  rand bit [31:0] addr;
+  rand bit [31:0] data;
+
+  function new(string name="ahb_wr_rdback_seq"); 
+  super.new(name); 
+  endfunction
+
+  task body();
+    do_write   = 1;
+    start_addr = addr;
+    wdata = data;
+    send_txn();  // write
+    do_write   = 0;
+    start_addr = addr;             
+    send_txn();  // readback
+  endtask
+endclass
+
+// TC02: N random single reads
+class ahb_rand_read_seq extends ahb_base_seq;
+  `uvm_object_utils(ahb_rand_read_seq)
+  int unsigned num_txns = 10;
+  function new(string name="ahb_rand_read_seq");
+    super.new(name);
+  endfunction
+
+  task body();
+    repeat (num_txns) begin
+      // randomize the knobs themselves, then send
+      assert(this.randomize() with
+      { start_addr[31:16] == 16'h0000;
+      do_write == 0; burst_type == 0; size == 2; });
+      send_txn();
+    end
+  endtask
+endclass
+
+
+
+class ahb_monitor extends uvm_component;
+
+  `uvm_component_utils(ahb_monitor)
+
+  ahb_cfg        cfg;
+  virtual ahb_if vif;
+  uvm_analysis_port #(ahb_txn) ap;
+
+  function new(string name, uvm_component parent);
+    super.new(name, parent);
+    ap = new("ap", this);
+  endfunction
+
+  function void build_phase(uvm_phase phase);
+    super.build_phase(phase);
+    if (!uvm_config_db#(ahb_cfg)::get(this, "", "cfg", cfg))
+      `uvm_fatal(get_type_name(), "cfg not set")
+    vif = cfg.vif;
+  endfunction
+
+  task run_phase(uvm_phase phase);
+    fork
+      collect_transactions();
+      protocol_check();
+    join
+  endtask
+
+  task collect_transactions();
+    ahb_txn txn;
+    int     beat;
+    bit [31:0] addr, start_addr;
+
+    forever begin
+      @(posedge vif.HCLK);
+      if (vif.HRESETN !== 1'b1) 
+       continue;
+
+      // Address phase captured when HREADY high
+      if (vif.HREADY === 1'b1 && vif.HTRANS == 2'b10) begin // NONSEQ
+        txn        = ahb_txn::type_id::create("txn");
+        start_addr = vif.HADDR;
+        addr       = vif.HADDR;
+        txn.addr   = vif.HADDR;
+        txn.write  = vif.HWRITE;
+        txn.size   = vif.HSIZE;
+        txn.burst  = vif.HBURST;
+        txn.prot   = vif.HPROT;
+        if (txn.write) 
+           txn.data = new[16]; // max, trimmed later
+
+        txn.rd_data = new[16];
+        beat = 0;
+
+        // collect all beats of the burst
+        forever begin
+          // Data phase of current beat
+          @(posedge vif.HCLK);
+          while (vif.HREADY !== 1'b1) begin
+            if (vif.HRESP ===1'b1)
+              `uvm_error(get_type_name(), "ERROR response seen")
+            @(posedge vif.HCLK);
+          end
+          if (txn.write) txn.data[beat]     = vif.HWDATA;
+          else           txn.rd_data[beat]  = vif.HRDATA;
+          beat++;
+
+          // Next address phase: SEQ continues burst, else burst ended
+          if (vif.HTRANS == 2'b11) begin
+            addr =addr+ (1 << txn.size);
+          end
+          else break; // IDLE or NONSEQ => burst done
+        end
+
+        if (txn.write) begin
+          txn.data     = new[beat](txn.data);
+        end
+        txn.rd_data = new[beat](txn.rd_data);
+        ap.write(txn);
+      end
+    end
+  endtask
+
+  // Independent protocol assertions (sample-based)
+  task protocol_check();
+    forever begin
+      @(posedge vif.HCLK);
+      if (!vif.HRESETN) begin
+        // during reset HTRANS must be IDLE
+        if (vif.HTRANS != 2'b00)
+          `uvm_error("AHB_PROTO", "HTRANS not IDLE during reset")
+      end
+      else begin
+        // Valid HTRANS only when HREADY high (address phase sample point)
+        if (vif.HREADY === 1'b1 && vif.HTRANS == 2'b01)
+          `uvm_error("AHB_PROTO", "HTRANS BUSY is illegal in AHB-Lite single master")
+        // HSIZE vs address alignment
+	if (vif.HREADY === 1'b1 && vif.HTRANS inside {2'b10, 2'b11}) begin
+          case (vif.HSIZE)
+            3'b001: if (vif.HADDR[0] !== 1'b0)
+                      `uvm_error("AHB_PROTO", "Halfword not aligned")
+            3'b010: if (vif.HADDR[1:0] !== 2'b00)
+                      `uvm_error("AHB_PROTO", "Word not aligned")
+          endcase
+        end
+      end
+    end
+  endtask
+
+endclass
+
+class ahb_agent extends uvm_agent;
+
+  `uvm_component_utils(ahb_agent)
+
+  ahb_cfg       cfg;
+  ahb_driver    drv;
+  ahb_monitor   mon;
+  ahb_sequencer sqr;
+
+  function new(string name, uvm_component parent);
+    super.new(name, parent);
+  endfunction
+
+  function void build_phase(uvm_phase phase);
+    super.build_phase(phase);
+    if (!uvm_config_db#(ahb_cfg)::get(this, "", "cfg", cfg))
+      `uvm_fatal(get_type_name(), "cfg not set")
+
+    mon = ahb_monitor::type_id::create("mon", this);
+
+    if (cfg.is_active == UVM_ACTIVE) begin
+      drv = ahb_driver  ::type_id::create("drv", this);
+      sqr = ahb_sequencer::type_id::create("sqr", this);
+    end
+  endfunction
+
+  function void connect_phase(uvm_phase phase);
+    super.connect_phase(phase);
+    if (cfg.is_active == UVM_ACTIVE)
+      drv.seq_item_port.connect(sqr.seq_item_export);
+  endfunction
+
+endclass
+
+interface ahb_if #(
+  parameter int ADDR_WIDTH = 32,
+  parameter int DATA_WIDTH = 32
+) (
+  input logic HCLK,
+  input logic HRESETN
+);
+
+  logic [ADDR_WIDTH-1:0] HADDR;
+  logic [1:0]            HTRANS;   // AHB-Lite: SINGLE/NONSEQ/SEQ/IDLE
+  logic [2:0]            HSIZE;
+  logic [2:0]            HBURST;
+  logic [3:0]            HPROT;
+  logic                  HWRITE;
+  logic [DATA_WIDTH-1:0] HWDATA; 
+  logic [DATA_WIDTH-1:0] HRDATA;
+  logic                  HREADY;
+  logic                  HRESP;    // AHB-Lite: OKAY/ERROR
+
+  // Clocking block for master (driver)
+  clocking mst_cb @(posedge HCLK);
+    default input #1step output #1;
+    output HADDR, HTRANS, HSIZE, HBURST, HPROT,HWRITE, HWDATA;
+    input  HRDATA, HREADY, HRESP;
+  endclocking
+
+  // Clocking block for passive (monitor)
+  clocking mon_cb @(posedge HCLK);
+    default input #1step;
+    input HADDR, HTRANS, HSIZE, HBURST, HPROT, HWRITE,
+          HWDATA, HRDATA, HREADY, HRESP;
+  endclocking
+
+endinterface
+
+class ahb_txn extends uvm_sequence_item;
+// Control (address phase)
+rand bit [31:0]  addr;
+rand bit         write;
+rand bit [2:0]   size;     // 0:byte 1:half 2:word
+rand bit [2:0]   burst;    // 0:SINGLE 1:INCR 2:WRAP4 3:INCR4 4:WRAP8 5:INCR8 6:WRAP16 7:INCR16
+rand bit [3:0]   prot;
+// Data phase
+rand bit [31:0]  data[];   // length = number of beats
+bit [31:0] rd_data[];
+// Response captured
+bit error_resp;
+
+`uvm_object_utils_begin(ahb_txn)
+`uvm_field_int (addr,UVM_HEX)
+`uvm_field_int (write,UVM_BIN)
+`uvm_field_int (size,UVM_HEX)
+`uvm_field_int (burst,UVM_HEX)
+`uvm_field_array_int(data,UVM_HEX)
+`uvm_field_array_int(rd_data,UVM_HEX)
+`uvm_field_int (error_resp,UVM_BIN)
+`uvm_object_utils_end
+
+constraint c_size  { size inside {0,1,2}; }
+constraint c_burst { burst inside {[0:7]}; }
+constraint c_beats {
+(burst inside {0,1})-> data.size() == 1;// SINGLE/INCR (1 beat default)
+(burst inside {2,3})-> data.size() == 4;// WRAP4/INCR4
+(burst inside {4,5})-> data.size() == 8;// WRAP8/INCR8
+(burst inside {6,7})-> data.size() == 16;// WRAP16/INCR16
+}
+// INCR burst beat count
+rand int unsigned incr_len;
+constraint c_incr_len { (burst == 1) -> data.size() == incr_len;
+incr_len inside {[1:32]}; }
+// Address alignment to size
+constraint c_align {
+(size == 0) -> addr[1:0] == 0;  // byte, any (keep word aligned for simplicity)
+(size == 1) -> addr[1:0] == 0;
+(size == 2) -> addr[1:0] == 0;
+}
+
+function new(string name = "ahb_txn");
+ super.new(name);
+endfunction
+
+function int num_beats();
+	case (burst)
+		2,3: return 4;
+		4,5: return 8;
+		6,7: return 16;
+		1  : return data.size();
+		default: return 1;
+	endcase
+endfunction
+
+endclass
+
+class ahb_driver extends uvm_driver #(ahb_txn);
+  `uvm_component_utils(ahb_driver)
+  ahb_cfg     cfg;
+  virtual ahb_if vif;
+
+function new(string name, uvm_component parent);
+    super.new(name, parent);
+  endfunction
+function void build_phase(uvm_phase phase);
+ super.build_phase(phase);
+  if (!uvm_config_db#(ahb_cfg)::get(this, "", "cfg", cfg))
+   `uvm_fatal(get_type_name(), "cfg not set")
+ vif = cfg.vif;
+endfunction
+task run_phase(uvm_phase phase);
+ forever begin
+ seq_item_port.get_next_item(req);
+ drive_txn(req);
+ seq_item_port.item_done();
+ end
+endtask
+// Wait for reset deassertion
+task wait_reset();
+ wait (vif.HRESETN === 1'b1);
+ @(vif.mst_cb);
+endtask
+// Main AHB transaction driver
+// Implements AHB address/data pipelining:
+task drive_txn(ahb_txn txn);
+int beats;
+int i;
+bit [31:0] addr;
+bit [31:0] next_addr;
+bit hready;
+bit hresp;
+bit [31:0]  rdata;
+beats = txn.num_beats();
+if (beats <= 0)
+ return;
+wait_reset();
+// Initialize first address phase
+ addr = txn.addr;
+ vif.mst_cb.HADDR  <= addr;
+ vif.mst_cb.HWRITE <= txn.write;
+ vif.mst_cb.HSIZE  <= txn.size;
+ vif.mst_cb.HPROT  <= txn.prot;
+ vif.mst_cb.HBURST <= txn.burst;
+ vif.mst_cb.HTRANS <= 2'b10; // NONSEQ
+ // Each iteration completes one data phase.
+ // At the same time, when the current transfer completes,
+// the next address phase is driven.
+for (i = 0; i < beats; i++) begin
+ // Wait for current transfer/data phase.
+ // If HREADY=0, this transfer is extended.
+ // Address/control must NOT advance.
+ forever begin
+ @(vif.mst_cb);
+  hready = vif.mst_cb.HREADY;
+  hresp  = vif.mst_cb.HRESP;
+  rdata  = vif.mst_cb.HRDATA;
+// ERROR response first cycle:
+// HRESP=ERROR and HREADY=0
+// Do not complete the transfer yet.
+// checking the slave is ready nd free from the previous transaction 
+if ((hresp === 1'b1) && (hready === 1'b0)) begin
+`uvm_error(get_type_name(),$sformatf("AHB ERROR response first cycle: addr=0x%08h beat=%0d",addr,i));
+txn.error_resp = 1'b1; 
+// Stay in this loop.
+// Transfer completes only when HREADY becomes 1.
+continue;
+end
+// Transfer completes only when HREADY=1
+if (hready === 1'b1) begin
+// Save final response
+txn.error_resp|= hresp;
+// Capture read data
+if (!txn.write) begin //if it is read go into the loop.
+ if (txn.rd_data.size() != beats) //ex : beat=4 then it will check the 4 == size or not then it will enter loop
+  txn.rd_data = new[beats]; 
+  txn.rd_data[i] = rdata;
+end
+break;
+end
+end
+ if (i < beats - 1) begin
+ next_addr = get_next_addr(txn,addr,i);
+ addr = next_addr;
+// Next address phase
+  vif.mst_cb.HADDR  <= addr;
+  vif.mst_cb.HWRITE <= txn.write;
+  vif.mst_cb.HSIZE  <= txn.size;
+  vif.mst_cb.HPROT  <= txn.prot;
+  vif.mst_cb.HBURST <= txn.burst;
+  vif.mst_cb.HTRANS <= 2'b11;    // SEQ
+if (txn.write)
+ vif.mst_cb.HWDATA <= txn.data[i+1];
+end
+end
+    // Return bus to IDLE
+    vif.mst_cb.HTRANS <= 2'b00;        // IDLE
+    vif.mst_cb.HWRITE <= 1'b0;
+    vif.mst_cb.HWDATA <= '0;
+  endtask
+  // Address generation
+  // HBURST
+  // 000 = SINGLE
+  // 001 = INCR
+  // 010 = WRAP4
+  // 011 = INCR4
+  // 100 = WRAP8
+  // 101 = INCR8
+  // 110 = WRAP16
+  // 111 = INCR16
+  // For INCR/SINGLE, simple increment is sufficient.
+  // For WRAP bursts, wrapping is implemented.
+function automatic bit [31:0] get_next_addr(
+    ahb_txn    txn,
+    bit [31:0] curr_addr,
+    int  beat);
+    bit [31:0] transtfer_bytes;
+    bit [31:0] next;
+    bit [31:0] boundary;
+    int burst_len;
+    transfer_bytes = (32'(1) << txn.size);
+    case (txn.burst)
+      // SINGLE
+      3'b000: begin
+        next = curr_addr + transfer_bytes;
+      end
+      // INCR
+      3'b001: begin
+        next = curr_addr + transfer_bytes;
+      end
+      // WRAP4
+      3'b010: begin
+  burst_len = 4;
+  boundary = transfer_bytes * burst_len;
+  next = curr_addr + transfer_bytes;
+  if ((next & (boundary - 1)) ==((txn.addr) & (boundary - 1))) begin
+ // Not generally needed, kept for clarity
+ next = next;
+end
+// Wrap at aligned burst boundary
+if ((next & (boundary - 1)) == 0)
+  next = next - boundary;
+// More robust wrap calculation:
+next = txn.addr - (txn.addr % boundary)+ ((curr_addr + transfer_bytes - txn.addr)% boundary);
+end
+// INCR4
+ 3'b011: begin
+     next = curr_addr + transfer_bytes;
+end
+// WRAP8
+3'b100: begin
+burst_len = 8;
+boundary = transfer_bytes * burst_len;
+next = txn.addr - (txn.addr % boundary)+ ((curr_addr + transfer_bytes - txn.addr)% boundary);
+end
+// INCR8
+ 3'b101: begin
+ next = curr_addr + transfer_bytes;
+end
+// WRAP16
+ 3'b110: begin
+  burst_len = 16;
+  boundary = transfer_bytes * burst_len;
+ next = txn
+ .addr - (txn.addr % boundary)+ ((curr_addr + transfer_bytes - txn.addr)% boundary);
+end
+ // INCR16
+3'b111: begin
+ next = curr_addr + transfer_bytes;
+end
+default: begin
+ next = curr_addr + transfer_bytes;
+end
+endcase
+return next;
+endfunction
+endclass
+
+//=============================================================================
+// ahb_driver_pipelined.sv
+//
+// TRUE pipelined AHB-Lite master driver.
+//
+// Fixes both bugs identified in the previous version:
+//
+//   1. next_valid/next_txn are now REAL: a second concurrent process
+//      (fetch_proc) keeps feeding beats into a mailbox while bus_proc
+//      independently drives the bus. There is no "wait for data phase
+//      to fully finish before getting the next item" dependency anymore.
+//
+//   2. Burst support is implemented: SINGLE, INCR (undefined length),
+//      INCR4/8/16 and WRAP4/8/16 are all expanded into a per-beat
+//      queue with correct HTRANS (NONSEQ for beat 0, SEQ for beats
+//      1..N-1) and correct address generation (linear increment for
+//      INCR*, wrap-around for WRAP*).
+//
+// Architecture
+// ------------
+//
+//                 SEQUENCER
+//                     |
+//                     | get_next_item() / item_done()
+//                     v
+//              +----------------+
+//              |  fetch_proc    |   <-- expands 1 sequence item (which
+//              |  (process #1)  |       may represent a burst) into N
+//              +----------------+       per-beat micro-transactions
+//                     |
+//                     v  beat_mbx (mailbox #(ahb_beat))
+//              +----------------+
+//              |  bus_proc      |   <-- the ONLY process that drives
+//              |  (process #2)  |       vif.mst_cb.*. Implements the
+//              +----------------+       2-stage address/data pipeline.
+//                     |
+//                     v
+//                  AHB BUS
+//
+// Pipeline rule enforced by bus_proc (unchanged from before, this part
+// was already correct):
+//
+//   - While the current DATA phase beat has HREADY==0, the ADDRESS
+//     phase beat's control signals are NEVER touched -> address stays
+//     stable on the bus exactly as the AHB protocol requires.
+//   - The moment HREADY==1, the address-phase beat is promoted to the
+//     data-phase beat, and (if available) the *next* beat's address is
+//     placed on the bus in the same cycle.
+//
+// This is what actually produces:
+//
+//   C1  : T1 address
+//   C2  : T1 data + T2 address
+//   ...
+//   C11 : T1 completes (HREADY=1) + T2 address (held)
+//   C12 : T2 data + T3 address
+//
+//=============================================================================
+
+//-----------------------------------------------------------------------------
+// HBURST / HTRANS encodings (AHB-Lite)
+//-----------------------------------------------------------------------------
+typedef enum bit [2:0] {
+  AHB_SINGLE = 3'b000,
+  AHB_INCR   = 3'b001,  // undefined length incrementing
+  AHB_WRAP4  = 3'b010,
+  AHB_INCR4  = 3'b011,
+  AHB_WRAP8  = 3'b100,
+  AHB_INCR8  = 3'b101,
+  AHB_WRAP16 = 3'b110,
+  AHB_INCR16 = 3'b111
+} ahb_burst_e;
+
+typedef enum bit [1:0] {
+  AHB_IDLE   = 2'b00,
+  AHB_BUSY   = 2'b01,
+  AHB_NONSEQ = 2'b10,
+  AHB_SEQ    = 2'b11
+} ahb_trans_e;
+
+
+//-----------------------------------------------------------------------------
+// ahb_txn : the sequence-item level transaction.
+//
+// For SINGLE:            num_beats = 1
+// For INCR (undef len):  num_beats = data.size()  (caller decides length)
+// For INCR4/8/16:        num_beats = 4/8/16
+// For WRAP4/8/16:        num_beats = 4/8/16
+//
+// data[] holds write data per beat (index 0..num_beats-1) for writes.
+// rd_data[] is filled in by the driver, per beat, for reads.
+//-----------------------------------------------------------------------------
+class ahb_txn extends uvm_sequence_item;
+
+  `uvm_object_utils(ahb_txn)
+
+  rand bit [31:0]  addr;         // start address (beat 0)
+  rand bit         write;
+  rand bit [2:0]   size;         // HSIZE: 0=byte,1=hword,2=word,...
+       bit [2:0]   prot;
+  rand ahb_burst_e burst;
+
+  rand bit [31:0]  data[];       // write data, one entry per beat
+       bit [31:0]  rd_data[];    // read data,  one entry per beat
+       bit         error_resp;   // set if ANY beat returned HRESP=ERROR
+
+  function new(string name = "ahb_txn");
+    super.new(name);
+  endfunction
+
+  // Number of beats this item expands to.
+  function int num_beats();
+    case (burst)
+      AHB_SINGLE:                    return 1;
+      AHB_INCR4,  AHB_WRAP4:         return 4;
+      AHB_INCR8,  AHB_WRAP8:         return 8;
+      AHB_INCR16, AHB_WRAP16:        return 16;
+      AHB_INCR:                      return data.size(); // caller-defined
+      default:                       return 1;
+    endcase
+  endfunction
+
+endclass
+
+
+//-----------------------------------------------------------------------------
+// ahb_beat : one AHB address-phase/data-phase beat. This is the internal
+// micro-transaction that actually travels through the pipeline. It is
+// NOT a uvm_sequence_item -- it never goes through get_next_item(); it
+// is produced internally by fetch_proc from a single ahb_txn.
+//-----------------------------------------------------------------------------
+class ahb_beat;
+
+  bit  [31:0]  addr;
+  bit          write;
+  bit  [2:0]   size;
+  bit  [2:0]   prot;
+  ahb_burst_e  burst;
+  ahb_trans_e  trans;        // NONSEQ for beat 0 of an item, SEQ otherwise
+  bit  [31:0]  wdata;
+
+  bit  [31:0]  rdata;        // filled in by bus_proc on completion
+  bit          hresp_err;    // filled in by bus_proc on completion
+
+  ahb_txn      parent;       // back-pointer to the owning item
+  int          beat_idx;     // index within parent (0..num_beats-1)
+  bit          last_beat;    // 1 if this is the final beat of parent
+
+endclass
+
+
+//-----------------------------------------------------------------------------
+// ahb_driver
+//-----------------------------------------------------------------------------
+class ahb_driver extends uvm_driver #(ahb_txn);
+
+  `uvm_component_utils(ahb_driver)
+
+  ahb_cfg         cfg;
+  virtual ahb_if  vif;
+
+  // Completed-item broadcast: downstream scoreboard/monitor-equivalent
+  // consumers subscribe here. This fires when the LAST beat of an item
+  // has actually completed on the bus (HREADY=1 on its data phase),
+  // NOT at item_done() time -- those are deliberately different events
+  // in a pipelined driver.
+  uvm_analysis_port #(ahb_txn) item_completed_ap;
+
+  // Depth-unbounded internal beat queue between fetch_proc and bus_proc.
+  mailbox #(ahb_beat) beat_mbx;
+
+  function new(string name, uvm_component parent);
+    super.new(name, parent);
+    beat_mbx          = new();
+    item_completed_ap = new("item_completed_ap", this);
+  endfunction
+
+  function void build_phase(uvm_phase phase);
+    super.build_phase(phase);
+    if (!uvm_config_db#(ahb_cfg)::get(this, "", "cfg", cfg))
+      `uvm_fatal(get_type_name(), "cfg not set")
+    vif = cfg.vif;
+  endfunction
+
+
+  //---------------------------------------------------------------------
+  // run_phase : launch the two concurrent processes. Neither ever
+  // waits on the other's completion condition -- that's the fix.
+  //---------------------------------------------------------------------
+  task run_phase(uvm_phase phase);
+    wait_reset();
+    fork
+      fetch_proc();
+      bus_proc();
+    join
+  endtask
+
+
+  task wait_reset();
+    wait (vif.HRESETN === 1'b1);
+    @(vif.mst_cb);
+  endtask
+
+
+  //=======================================================================
+  // PROCESS #1 : fetch_proc
+  //
+  // Only responsibility: pull sequence items, expand each into its
+  // per-beat queue, push beats into beat_mbx, and call item_done().
+  //
+  // Crucially, this process NEVER waits on HREADY or on bus_proc.
+  // It can run arbitrarily far ahead of the bus (limited only by the
+  // sequencer and, if you want back-pressure, by making beat_mbx
+  // bounded -- see note at the end of this task).
+  //=======================================================================
+  task fetch_proc();
+
+    ahb_txn   req;
+    ahb_txn   txn;
+    ahb_beat  beat;
+    int       n;
+    bit [31:0] beat_addr;
+    bit [31:0] wrap_size_bytes;
+    bit [31:0] wrap_mask;
+    bit [31:0] incr_bytes;
+
+    forever begin
+
+      // ---------------------------------------------------------------
+      // Get the next item from the sequencer.
+      // ---------------------------------------------------------------
+      seq_item_port.get_next_item(req);
+
+      // Clone: item_done() below hands control back to the sequence,
+      // which may reuse/modify 'req'. The beats we push reference
+      // 'txn' (the clone), which stays stable for as long as bus_proc
+      // needs it.
+      $cast(txn, req.clone());
+
+      n          = txn.num_beats();
+      incr_bytes = (1 << txn.size);
+
+      // Precompute the wrap window for WRAP* bursts.
+      wrap_size_bytes = n * incr_bytes;
+      wrap_mask       = wrap_size_bytes - 1;
+
+      if (txn.rd_data.size() != n) txn.rd_data = new[n];
+
+      // -----------------------------------------------------------
+      // Expand the item into its per-beat queue and push each beat
+      // into the mailbox. This is what actually implements bursts:
+      // beat 0 is NONSEQ, beats 1..n-1 are SEQ, and addresses are
+      // generated per AHB rules (linear for INCR*, wrapping for
+      // WRAP*).
+      // -----------------------------------------------------------
+      for (int i = 0; i < n; i++) begin
+
+        beat = new();
+
+        if (i == 0) begin
+          beat_addr = txn.addr;
+        end
+        else if (txn.burst == AHB_WRAP4  ||
+                 txn.burst == AHB_WRAP8  ||
+                 txn.burst == AHB_WRAP16) begin
+          // Wrap within the (naturally-aligned) window; the top bits
+          // above the window stay fixed, the bits inside the window
+          // wrap around.
+          beat_addr = (txn.addr & ~wrap_mask) |
+                      ((txn.addr + i * incr_bytes) & wrap_mask);
+        end
+        else begin
+          // SINGLE / INCR / INCR4/8/16 : plain linear increment.
+          beat_addr = txn.addr + i * incr_bytes;
+        end
+
+        beat.addr     = beat_addr;
+        beat.write    = txn.write;
+        beat.size     = txn.size;
+        beat.prot     = txn.prot;
+        beat.burst    = txn.burst;
+        beat.trans    = (i == 0) ? AHB_NONSEQ : AHB_SEQ;
+        beat.wdata    = txn.write ? txn.data[i] : '0;
+        beat.parent   = txn;
+        beat.beat_idx = i;
+        beat.last_beat = (i == n - 1);
+
+        beat_mbx.put(beat);
+      end
+
+      // -----------------------------------------------------------
+      // Tell the sequencer we've accepted this item. This can happen
+      // as soon as the beats are queued -- it does NOT wait for any
+      // of them to actually reach the bus. This is what allows the
+      // sequence to generate item N+1 while item N (or even item
+      // N-1) is still being driven.
+      // -----------------------------------------------------------
+      seq_item_port.item_done();
+
+      // NOTE on flow control: beat_mbx is unbounded above, so
+      // fetch_proc can run arbitrarily far ahead of bus_proc. If you
+      // want to cap how deep the pipeline is allowed to get (e.g. to
+      // match a real DUT's outstanding-transaction limit), change
+      // beat_mbx = new() to beat_mbx = new(DEPTH) and mailbox.put()
+      // will then block once full -- giving natural back-pressure
+      // without touching bus_proc at all.
+
+    end
+
+  endtask
+
+
+  //=======================================================================
+  // PROCESS #2 : bus_proc
+  //
+  // The ONLY process that drives vif.mst_cb.*. Implements the 2-stage
+  // address/data pipeline:
+  //
+  //   addr_beat : beat currently in the ADDRESS phase (or none)
+  //   data_beat : beat currently in the DATA phase (or none)
+  //
+  // On every clock:
+  //   - if data_beat exists and HREADY==0 : do nothing, hold
+  //     everything exactly as-is (this is the address-stability rule).
+  //   - if data_beat exists and HREADY==1 : data_beat is complete,
+  //     capture response/read-data, broadcast if last_beat.
+  //   - once data_beat is cleared (or was never present): promote
+  //     addr_beat -> data_beat, and if another beat is already
+  //     waiting in beat_mbx, pull it and drive its address phase in
+  //     the SAME cycle -- this is the actual pipelining step.
+  //=======================================================================
+  task bus_proc();
+
+    ahb_beat addr_beat;
+    ahb_beat data_beat;
+    bit      have_addr;
+    bit      have_data;
+
+    have_addr = 0;
+    have_data = 0;
+    drive_idle();
+
+    forever begin
+
+      // If nothing is currently in the address phase, block until
+      // fetch_proc supplies one. While blocked, the bus sits IDLE.
+      if (!have_addr) begin
+        beat_mbx.get(addr_beat);
+        drive_address_phase(addr_beat);
+        have_addr = 1;
+      end
+
+      // Advance one AHB clock. During this clock: addr_beat is being
+      // sampled as the address phase, and data_beat (if any) is being
+      // sampled for HREADY/HRESP/HRDATA completion.
+      @(vif.mst_cb);
+
+      if (have_data) begin
+
+        if (vif.mst_cb.HREADY === 1'b0) begin
+          // ---------------------------------------------------------
+          // STALL. data_beat's data phase is not done.
+          //
+          // Do NOT touch HADDR/HWRITE/HSIZE/HPROT/HBURST/HTRANS here.
+          // addr_beat's address phase (already driven) simply remains
+          // on the bus unchanged. This is the critical rule.
+          // ---------------------------------------------------------
+          if (vif.mst_cb.HRESP === 1'b1) begin
+            data_beat.hresp_err = 1'b1;
+            `uvm_error(get_type_name(),
+              $sformatf("AHB ERROR (first cycle), addr=0x%08h", data_beat.addr))
+          end
+          continue;   // re-loop: have_addr stays 1, skip straight to next @(mst_cb)
+        end
+
+        // -------------------------------------------------------------
+        // data_beat's data phase COMPLETES this cycle.
+        // -------------------------------------------------------------
+        data_beat.hresp_err |= vif.mst_cb.HRESP;
+
+        if (!data_beat.write)
+          data_beat.rdata = vif.mst_cb.HRDATA;
+
+        write_beat_result(data_beat);
+
+        have_data = 0;
+      end
+
+      // -----------------------------------------------------------
+      // Promote addr_beat -> data_beat (it was on the bus for exactly
+      // one address-phase cycle, or held across N stalled cycles --
+      // either way it now enters its data phase).
+      // -----------------------------------------------------------
+      if (have_addr) begin
+        data_beat = addr_beat;
+        have_data = 1;
+        have_addr = 0;
+      end
+
+      // -----------------------------------------------------------
+      // Pipeline the NEXT beat's address phase in, right now, if one
+      // is already available. This is the line that makes it real
+      // pipelining: T(N+1)'s address goes out in the same cycle that
+      // T(N) enters its data phase.
+      // -----------------------------------------------------------
+      if (beat_mbx.num() > 0) begin
+        beat_mbx.get(addr_beat);
+        drive_address_phase(addr_beat);
+        have_addr = 1;
+      end
+      else begin
+        // Nothing queued right now -- go IDLE. Next loop iteration's
+        // "if (!have_addr)" will block-wait for fetch_proc to supply
+        // the next beat. Note data_beat (if any) is still correctly
+        // draining independently of this.
+        drive_idle();
+      end
+
+    end
+
+  endtask
+
+
+  //---------------------------------------------------------------------
+  // Drive one beat's address-phase signals.
+  //---------------------------------------------------------------------
+  task drive_address_phase(ahb_beat b);
+    vif.mst_cb.HADDR  <= b.addr;
+    vif.mst_cb.HWRITE <= b.write;
+    vif.mst_cb.HSIZE  <= b.size;
+    vif.mst_cb.HPROT  <= b.prot;
+    vif.mst_cb.HBURST <= b.burst;
+    vif.mst_cb.HTRANS <= b.trans;
+    // HWDATA for a write belongs to the DATA phase, i.e. it must be
+    // valid one cycle later than HADDR. Driving it here means it
+    // becomes valid for THIS beat's data phase on the next clock,
+    // which is exactly the AHB timing relationship required -- do
+    // not drive HWDATA any earlier or any later than this.
+    if (b.write)
+      vif.mst_cb.HWDATA <= b.wdata;
+  endtask
+
+
+  task drive_idle();
+    vif.mst_cb.HTRANS <= AHB_IDLE;
+    vif.mst_cb.HWRITE <= 1'b0;
+  endtask
+
+
+  //---------------------------------------------------------------------
+  // Store a completed beat's result back into its parent txn, and
+  // broadcast the parent on item_completed_ap once its LAST beat is
+  // done. This is the "actual bus completion", deliberately decoupled
+  // from item_done() as discussed.
+  //---------------------------------------------------------------------
+  function void write_beat_result(ahb_beat b);
+    if (!b.write)
+      b.parent.rd_data[b.beat_idx] = b.rdata;
+    b.parent.error_resp |= b.hresp_err;
+
+    if (b.last_beat)
+      item_completed_ap.write(b.parent);
+  endfunction
+
+endclass
